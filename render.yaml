@@ -1,9 +1,11 @@
-﻿services:
+services:
   - type: web
     name: recherche-image
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.11
+      - key: PORT
+        value: 10000
