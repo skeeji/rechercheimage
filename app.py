@@ -40,7 +40,6 @@ embedding_model = None
 nn_model = None
 
 # Chargement des embeddings et des métadonnées
-@app.before_first_request
 def load_data():
     global embeddings, metadata, embedding_model, nn_model
 
@@ -82,6 +81,12 @@ def load_data():
         embeddings = []
         metadata = []
         raise
+
+@app.before_request
+def before_request():
+    global embedding_model, embeddings
+    if embedding_model is None:
+        load_data()
 
 # Fonction pour traiter l'image et extraire l'embedding
 def process_image(image_path, target_size=(224, 224)):
