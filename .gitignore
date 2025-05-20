@@ -1,0 +1,28 @@
+﻿# Environnement Python
+venv/
+env/
+.venv/
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+
+# Fichiers temporaires
+static/uploads/*
+resultats.html
+
+# Fichiers sensibles
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs et bases de données
+*.log
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
