@@ -1,10 +1,9 @@
-﻿import os
+import os
 import pickle
 import json
 import numpy as np
 from PIL import Image
 import tensorflow as tf
-import tensorflow_hub as hub
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from werkzeug.utils import secure_filename
 from sklearn.neighbors import NearestNeighbors
@@ -17,14 +16,17 @@ from dotenv import load_dotenv
 # Configuration de l'environnement
 load_dotenv()
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Supprimer les messages TF
+os.environ['TFHUB_CACHE_DIR'] = os.path.join(os.getcwd(), 'models', 'tfhub_cache')
 
 # Configuration de l'application
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'static/uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max
 app.config['EMBEDDINGS_PATH'] = 'data/embeddings.pkl'
+app.config['NPY_EMBEDDINGS_PATH'] = 'data/embeddings.npy'
 app.config['METADATA_PATH'] = 'data/luminaires.json'
 app.config['DEFAULT_NUM_RESULTS'] = 12
+app.config['MODEL_PATH'] = 'models/efficientnet_v2_model'
 
 # Création du dossier d'upload s'il n'existe pas
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -43,12 +45,21 @@ nn_model = None
 def load_data():
     global embeddings, metadata, embedding_model, nn_model
 
+    # Chargement du modèle
     logger.info("Chargement du modèle d'embedding...")
     try:
-        # Utiliser EXACTEMENT le même modèle qui a généré les embeddings
-        model_url = "https://tfhub.dev/google/imagenet/efficientnet_v2_imagenet21k_b3/feature_vector/2"
-        embedding_model = hub.KerasLayer(model_url)
-        logger.info("Modèle d'embedding chargé avec succès")
+        # D'abord essayer de charger le modèle préenregistré
+        if os.path.exists(app.config['MODEL_PATH']):
+            logger.info("Chargement du modèle préenregistré...")
+            embedding_model = tf.keras.models.load_model(app.config['MODEL_PATH'])
+            logger.info("Modèle préenregistré chargé avec succès")
+        else:
+            # Fallback: charger depuis TF Hub
+            logger.info("Modèle préenregistré non trouvé, téléchargement depuis TF Hub...")
+            import tensorflow_hub as hub
+            model_url = "https://tfhub.dev/google/imagenet/efficientnet_v2_imagenet21k_b3/feature_vector/2"
+            embedding_model = hub.KerasLayer(model_url)
+            logger.info("Modèle téléchargé avec succès")
     except Exception as e:
         logger.error(f"Erreur lors du chargement du modèle: {e}")
         logger.error(traceback.format_exc())
@@ -58,47 +69,64 @@ def load_data():
     start_time = time.time()
 
     try:
-        with open(app.config['EMBEDDINGS_PATH'], 'rb') as f:
-            embeddings = pickle.load(f)
-            logger.info(f"Nombre d'embeddings chargés: {len(embeddings)}")
+        # Essayer de charger les embeddings au format NPY (plus rapide)
+        if os.path.exists(app.config['NPY_EMBEDDINGS_PATH']):
+            logger.info("Chargement des embeddings NPY...")
+            embeddings = np.load(app.config['NPY_EMBEDDINGS_PATH'])
+        else:
+            # Fallback: charger au format PKL
+            logger.info("Chargement des embeddings PKL...")
+            with open(app.config['EMBEDDINGS_PATH'], 'rb') as f:
+                embeddings = pickle.load(f)
+        
+        logger.info(f"Nombre d'embeddings chargés: {len(embeddings)}")
+        logger.info(f"Dimension des embeddings: {embeddings.shape}")
 
         with open(app.config['METADATA_PATH'], 'r', encoding='utf-8') as f:
             metadata = json.load(f)
             logger.info(f"Nombre d'éléments dans metadata: {len(metadata)}")
-
-        logger.info(f"Dimension des embeddings: {embeddings.shape}")
 
         # Préparation du modèle de recherche des plus proches voisins
         nn_model = NearestNeighbors(metric='cosine')
         nn_model.fit(embeddings)
         logger.info("Modèle de recherche initialisé")
         
-        logger.info("Application démarrée avec succès!")
+        logger.info(f"Données chargées en {time.time() - start_time:.2f} secondes")
 
     except Exception as e:
         logger.error(f"Erreur lors du chargement des données: {e}")
         logger.error(traceback.format_exc())
-        embeddings = []
-        metadata = []
+        embeddings = None
+        metadata = None
         raise
 
-@app.before_request
-def before_request():
-    global embedding_model, embeddings
+# Fonction pour obtenir le modèle (chargé à la demande)
+def get_model():
+    global embedding_model
     if embedding_model is None:
         load_data()
+    return embedding_model
+
+# Fonction pour obtenir les données (chargées à la demande)
+def get_data():
+    global embeddings, metadata, nn_model
+    if embeddings is None or metadata is None or nn_model is None:
+        load_data()
+    return embeddings, metadata, nn_model
 
 # Fonction pour traiter l'image et extraire l'embedding
 def process_image(image_path, target_size=(224, 224)):
     try:
-        # Utiliser la même méthode de traitement que dans votre script de génération
+        # Utiliser la même méthode de traitement que dans le script de génération
         img = Image.open(image_path).convert('RGB')
         img = img.resize(target_size)
         img_array = np.array(img) / 255.0
         img_batch = np.expand_dims(img_array, axis=0)
 
-        features = embedding_model(img_batch).numpy().flatten()
-        # Normaliser le vecteur comme dans votre script de génération
+        model = get_model()
+        features = model(img_batch).numpy().flatten()
+        
+        # Normaliser le vecteur comme dans le script de génération
         norm = np.linalg.norm(features)
         if norm > 0:
             features = features / norm
@@ -120,6 +148,7 @@ def search():
     try:
         start_time = time.time()
 
+        # Vérifier si l'image est fournie
         if 'image' not in request.files:
             return jsonify({'error': 'Aucune image fournie'}), 400
 
@@ -127,22 +156,30 @@ def search():
         if file.filename == '':
             return jsonify({'error': 'Nom de fichier vide'}), 400
 
+        # Obtenir le nombre de résultats souhaités
         try:
             num_results = int(request.form.get('num_results', app.config['DEFAULT_NUM_RESULTS']))
         except:
             num_results = app.config['DEFAULT_NUM_RESULTS']
 
+        # Sauvegarder l'image téléchargée
         filename = secure_filename(f"{uuid.uuid4()}{os.path.splitext(file.filename)[1]}")
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
+        # Traiter l'image et extraire les caractéristiques
         query_features = process_image(filepath)
         if query_features is None:
             return jsonify({'error': 'Impossible de traiter cette image'}), 400
 
+        # Obtenir les données nécessaires pour la recherche
+        embeddings, metadata, nn_model = get_data()
+        
+        # Recherche des plus proches voisins
         num_neighbors = min(num_results, len(embeddings))
         distances, indices = nn_model.kneighbors([query_features], n_neighbors=num_neighbors)
 
+        # Préparer les résultats
         results = []
         for i, idx in enumerate(indices[0]):
             item = metadata[idx].copy()
@@ -183,6 +220,12 @@ def database_image(filename):
 def results():
     return render_template('results.html')
 
+# Préchargement des données (pour Gunicorn)
+def preload_app():
+    load_data()
+    logger.info("Préchargement terminé, application prête!")
+
 if __name__ == '__main__':
+    preload_app()  # Préchargement pour le développement local
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
