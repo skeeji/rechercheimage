@@ -74,13 +74,11 @@
             font-size: 14px;
             color: #6c757d;
         }
-        .timeout-warning {
-            background-color: #fff3cd;
-            border: 1px solid #ffeaa7;
-            border-radius: 5px;
-            padding: 15px;
-            margin: 20px 0;
-            color: #856404;
+        .loading-message {
+            text-align: center;
+            margin-top: 10px;
+            font-style: italic;
+            color: #666;
         }
     </style>
 </head>
@@ -106,11 +104,10 @@
                     <button id="search-btn" class="btn btn-primary" disabled>Rechercher des luminaires similaires</button>
                 </div>
                 
-                <div id="timeout-warning" class="timeout-warning" style="display: none;">
-                    ⚠️ La recherche peut prendre jusqu'à 3 minutes au premier lancement (chargement du modèle).
-                </div>
-                
                 <div id="loader" class="loader"></div>
+                <div id="loading-message" class="loading-message" style="display: none;">
+                    Chargement du modèle... Cela peut prendre quelques instants la première fois.
+                </div>
                 <p id="stats" class="stats"></p>
             </div>
         </div>
@@ -126,9 +123,9 @@
             const uploadPrompt = document.getElementById('upload-prompt');
             const searchBtn = document.getElementById('search-btn');
             const loader = document.getElementById('loader');
+            const loadingMessage = document.getElementById('loading-message');
             const resultsContainer = document.getElementById('results-container');
             const statsElement = document.getElementById('stats');
-            const timeoutWarning = document.getElementById('timeout-warning');
             
             uploadArea.addEventListener('click', function() {
                 fileInput.click();
@@ -163,19 +160,16 @@
             });
             
             function processFile(file) {
-                // Vérifier le type de fichier
                 if (!file.type.match('image.*')) {
                     alert('Veuillez sélectionner une image (JPG, PNG, WEBP)');
                     return;
                 }
                 
-                // Vérifier la taille du fichier (max 8MB)
                 if (file.size > 8 * 1024 * 1024) {
                     alert('La taille de l\'image ne doit pas dépasser 8MB');
                     return;
                 }
                 
-                // Afficher l'aperçu de l'image
                 const reader = new FileReader();
                 reader.onload = function(e) {
                     previewImage.src = e.target.result;
@@ -187,25 +181,20 @@
             }
             
             function searchSimilarProducts() {
-                // Afficher le loader et les avertissements
                 loader.style.display = 'block';
-                timeoutWarning.style.display = 'block';
+                loadingMessage.style.display = 'block';
                 searchBtn.disabled = true;
                 resultsContainer.innerHTML = '';
                 statsElement.textContent = '';
                 
-                // Créer le formulaire
                 const formData = new FormData();
                 formData.append('image', fileInput.files[0]);
                 formData.append('num_results', 6);
                 
-                // Configuration du timeout
+                // Timeout étendu pour la première recherche
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => {
-                    controller.abort();
-                }, 240000); // 4 minutes
+                const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minutes
                 
-                // Envoyer la requête
                 fetch('/api/search', {
                     method: 'POST',
                     body: formData,
@@ -213,37 +202,24 @@
                 })
                 .then(response => {
                     clearTimeout(timeoutId);
-                    
                     if (!response.ok) {
-                        return response.text().then(text => {
-                            let errorMessage;
-                            try {
-                                const data = JSON.parse(text);
-                                errorMessage = data.error || 'Une erreur est survenue';
-                            } catch {
-                                errorMessage = 'Erreur du serveur';
-                            }
-                            throw new Error(errorMessage);
+                        return response.json().then(data => {
+                            throw new Error(data.error || 'Une erreur est survenue');
                         });
                     }
-                    
-                    const contentType = response.headers.get('content-type');
-                    if (!contentType || !contentType.includes('application/json')) {
-                        throw new Error('Réponse invalide du serveur');
-                    }
-                    
                     return response.json();
                 })
                 .then(data => {
                     displayResults(data);
                 })
                 .catch(error => {
-                    clearTimeout(timeoutId);
                     console.error('Erreur:', error);
+                    let errorMessage = 'Une erreur est survenue';
                     
-                    let errorMessage = error.message;
                     if (error.name === 'AbortError') {
-                        errorMessage = 'Timeout: La recherche prend trop de temps. Veuillez réessayer.';
+                        errorMessage = 'Timeout: La recherche prend trop de temps. Le modèle se charge, veuillez réessayer dans quelques secondes.';
+                    } else {
+                        errorMessage = error.message || 'Impossible de traiter cette recherche';
                     }
                     
                     resultsContainer.innerHTML = `
@@ -251,15 +227,14 @@
                             <div class="no-results">
                                 <h3>Une erreur est survenue</h3>
                                 <p>${errorMessage}</p>
-                                <button class="btn btn-secondary mt-3" onclick="location.reload()">Réessayer</button>
+                                ${error.name === 'AbortError' ? '<small class="text-muted">Le modèle est en cours de chargement. Les prochaines recherches seront plus rapides.</small>' : ''}
                             </div>
                         </div>
                     `;
                 })
                 .finally(() => {
-                    clearTimeout(timeoutId);
                     loader.style.display = 'none';
-                    timeoutWarning.style.display = 'none';
+                    loadingMessage.style.display = 'none';
                     searchBtn.disabled = false;
                 });
             }
