@@ -40,13 +40,12 @@ is_loaded = False
 is_loading = False
 
 def load_embedding_model():
-    """Charge le modèle d'embedding (version allégée)"""
+    """Charge le modèle d'embedding"""
     global embedding_model
     
     try:
         logger.info("Chargement du modèle MobileNetV2...")
         
-        # Utiliser MobileNetV2 au lieu de TensorFlow Hub (plus léger)
         base_model = tf.keras.applications.MobileNetV2(
             weights='imagenet',
             include_top=False,
@@ -65,12 +64,7 @@ def load_embedding_model():
 
 def load_data():
     """Charge les embeddings et métadonnées"""
-    global stored_embeddings, luminaires_data, is_loaded, is_loading
-    
-    if is_loading:
-        return False
-        
-    is_loading = True
+    global stored_embeddings, luminaires_data
     
     try:
         logger.info("Chargement des données...")
@@ -83,7 +77,6 @@ def load_data():
             stored_embeddings = np.array(stored_embeddings)
             logger.info(f"Embeddings chargés: {stored_embeddings.shape}")
         else:
-            # Essayer le format .npy
             embeddings_npy_path = 'data/embeddings.npy'
             if os.path.exists(embeddings_npy_path):
                 stored_embeddings = np.load(embeddings_npy_path)
@@ -111,10 +104,9 @@ def load_data():
             logger.info(f"Données ajustées à {min_len} éléments")
         
         # Charger le modèle
-        load_embedding_model()
+        model_success = load_embedding_model()
         
-        is_loaded = True
-        logger.info("Toutes les données chargées avec succès")
+        logger.info("✅ Toutes les données chargées avec succès")
         return True
         
     except Exception as e:
@@ -122,125 +114,107 @@ def load_data():
         logger.error(traceback.format_exc())
         return False
     finally:
-        is_loading = False
         gc.collect()
 
-def extract_features(image):
-    """Extrait les caractéristiques de l'image"""
-    global embedding_model
+def background_loading():
+    """Charge les données en arrière-plan"""
+    global is_loaded, is_loading
+    logger.info("Démarrage du chargement en arrière-plan...")
     
     try:
-        if embedding_model is None:
-            # Méthode de fallback simple
-            return extract_simple_features(image)
-        
-        # Préprocessing
+        success = load_data()
+        if success:
+            is_loaded = True
+            is_loading = False
+            logger.info("✅ Chargement terminé avec succès!")
+        else:
+            is_loading = False
+            logger.error("❌ Échec du chargement")
+    except Exception as e:
+        is_loading = False
+        logger.error(f"❌ Erreur chargement: {e}")
+
+def preprocess_image(image):
+    """Préprocesse l'image pour le modèle"""
+    try:
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
         image = image.resize((224, 224))
-        img_array = np.array(image)
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array = tf.cast(img_array, tf.float32) / 255.0
+        image_array = np.array(image)
+        image_array = np.expand_dims(image_array, axis=0)
+        image_array = tf.keras.applications.mobilenet_v2.preprocess_input(image_array)
         
-        # Extraction des caractéristiques
-        features = embedding_model.predict(img_array, verbose=0)
-        return features.flatten()
-        
+        return image_array
+    except Exception as e:
+        logger.error(f"Erreur preprocessing: {e}")
+        raise
+
+def extract_features(image):
+    """Extrait les caractéristiques d'une image"""
+    global embedding_model
+    
+    if embedding_model is None:
+        raise Exception("Modèle d'embedding non chargé")
+    
+    try:
+        processed_image = preprocess_image(image)
+        features = embedding_model.predict(processed_image, verbose=0)
+        return features[0]
     except Exception as e:
         logger.error(f"Erreur extraction features: {e}")
-        return extract_simple_features(image)
+        raise
 
-def extract_simple_features(image):
-    """Méthode de fallback pour l'extraction de caractéristiques"""
-    try:
-        # Caractéristiques basiques comme fallback
-        image = image.resize((64, 64)).convert('RGB')
-        pixels = np.array(image)
-        
-        # Moyennes par canal
-        mean_r = np.mean(pixels[:,:,0])
-        mean_g = np.mean(pixels[:,:,1]) 
-        mean_b = np.mean(pixels[:,:,2])
-        
-        # Écarts-types
-        std_r = np.std(pixels[:,:,0])
-        std_g = np.std(pixels[:,:,1])
-        std_b = np.std(pixels[:,:,2])
-        
-        # Histogrammes simplifiés
-        hist_r, _ = np.histogram(pixels[:,:,0], bins=8, range=(0, 255))
-        hist_g, _ = np.histogram(pixels[:,:,1], bins=8, range=(0, 255))
-        hist_b, _ = np.histogram(pixels[:,:,2], bins=8, range=(0, 255))
-        
-        # Normaliser les histogrammes
-        hist_r = hist_r / np.sum(hist_r)
-        hist_g = hist_g / np.sum(hist_g)
-        hist_b = hist_b / np.sum(hist_b)
-        
-        # Combiner toutes les caractéristiques
-        features = np.concatenate([
-            [mean_r, mean_g, mean_b, std_r, std_g, std_b],
-            hist_r, hist_g, hist_b
-        ])
-        
-        # Étendre à 1280 dimensions pour compatibilité
-        if len(features) < 1280:
-            padding = np.zeros(1280 - len(features))
-            features = np.concatenate([features, padding])
-        
-        return features
-        
-    except Exception:
-        # En dernier recours
-        return np.random.random(1280)
-
-# Chargement en arrière-plan
-def background_loading():
-    """Charge les données en arrière-plan"""
-    logger.info("Démarrage du chargement en arrière-plan...")
-    load_data()
-
-# Démarrer le chargement en arrière-plan
-threading.Thread(target=background_loading, daemon=True).start()
-
+# Routes
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api/health')
 def health():
-    """Endpoint de santé de l'application"""
+    """Endpoint de santé"""
     return jsonify({
-        'status': 'ok',
-        'data_loaded': is_loaded,
-        'model_loaded': embedding_model is not None,
-        'embeddings_count': len(stored_embeddings) if stored_embeddings is not None else 0,
-        'products_count': len(luminaires_data) if luminaires_data is not None else 0
+        'status': 'healthy',
+        'is_loaded': is_loaded,
+        'is_loading': is_loading,
+        'has_embeddings': stored_embeddings is not None,
+        'has_metadata': luminaires_data is not None,
+        'has_model': embedding_model is not None,
+        'embeddings_count': len(stored_embeddings) if stored_embeddings is not None else 0
     })
 
+@app.route('/api/force-load')
+def force_load():
+    """Force le chargement des données"""
+    global is_loaded, is_loading
+    
+    if is_loading:
+        return jsonify({'status': 'already_loading'})
+    
+    is_loading = True
+    success = load_data()
+    
+    if success:
+        is_loaded = True
+        is_loading = False
+        return jsonify({'status': 'success', 'loaded': True})
+    else:
+        is_loading = False
+        return jsonify({'status': 'error', 'loaded': False})
+
 @app.route('/api/search', methods=['POST'])
-def search_similar():
+def search():
+    if not is_loaded:
+        if is_loading:
+            return jsonify({'error': 'Système en cours de chargement, veuillez patienter...'}), 503
+        else:
+            return jsonify({'error': 'Système non initialisé'}), 503
+    
     start_time = time.time()
     
     try:
         logger.info("Début de la recherche...")
         
-        # Vérifier si les données sont chargées
-        if not is_loaded:
-            if is_loading:
-                return jsonify({
-                    'error': 'Système en cours de chargement, veuillez patienter...'
-                }), 503
-            else:
-                # Essayer de charger maintenant
-                logger.info("Tentative de chargement des données...")
-                if not load_data():
-                    return jsonify({
-                        'error': 'Impossible de charger les données'
-                    }), 503
-        
-        # Vérifier la présence du fichier
         if 'image' not in request.files:
             return jsonify({'error': 'Aucune image fournie'}), 400
         
@@ -296,6 +270,13 @@ def search_similar():
         }), 500
     finally:
         gc.collect()
+
+# Initialisation au démarrage
+if not is_loading and not is_loaded:
+    is_loading = True
+    thread = threading.Thread(target=background_loading)
+    thread.daemon = True
+    thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
