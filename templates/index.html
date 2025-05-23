@@ -185,81 +185,35 @@
                 formData.append('image', fileInput.files[0]);
                 formData.append('num_results', 12);
                 
-                // Envoyer la requête
-                fetch('/api/search', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => {
-                    if (!response.ok) {
-                        return response.json().then(data => {
-                            throw new Error(data.error || 'Une erreur est survenue');
-                        });
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    displayResults(data);
-                })
-                .catch(error => {
-                    console.error('Erreur:', error);
-                    resultsContainer.innerHTML = `
-                        <div class="col-12">
-                            <div class="no-results">
-                                <h3>Une erreur est survenue</h3>
-                                <p>${error.message || 'Impossible de traiter cette recherche'}</p>
-                            </div>
-                        </div>
-                    `;
-                })
-                .finally(() => {
-                    loader.style.display = 'none';
-                    searchBtn.disabled = false;
-                });
-            }
-            
-            function displayResults(data) {
-                const results = data.results;
-                
-                if (!results || results.length === 0) {
-                    resultsContainer.innerHTML = `
-                        <div class="col-12">
-                            <div class="no-results">
-                                <h3>Aucun résultat trouvé</h3>
-                                <p>Essayez avec une autre image</p>
-                            </div>
-                        </div>
-                    `;
-                    return;
-                }
-                
-                statsElement.textContent = `Recherche effectuée en ${data.processing_time.toFixed(2)} secondes • ${data.count} résultats`;
-                
-                results.forEach(item => {
-                    const similarity = (item.similarity * 100).toFixed(1);
-                    const resultHTML = `
-                        <div class="col-md-4 col-sm-6 mb-4">
-                            <div class="card result-card h-100">
-                                <div class="card-img-top p-2 bg-light">
-                                    <img src="${item.image_url}" class="result-image" alt="${item.name || 'Luminaire'}">
-                                </div>
-                                <div class="card-body">
-                                    <h5 class="card-title">${item.name || 'Produit sans nom'}</h5>
-                                    <p class="card-text">
-                                        <strong>Similarité:</strong> ${similarity}%<br>
-                                        <strong>Catégorie:</strong> ${item.category || 'Non spécifiée'}<br>
-                                        <strong>Prix:</strong> ${item.price ? item.price + ' €' : 'Non spécifié'}<br>
-                                        <strong>Style:</strong> ${item.style || 'Non spécifié'}<br>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                    
-                    resultsContainer.innerHTML += resultHTML;
-                });
-            }
-        });
-    </script>
-</body>
-</html>
+              const controller = new AbortController();
+const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minutes
+
+fetch('/api/search', {
+    method: 'POST',
+    body: formData,
+    signal: controller.signal
+})
+.then(response => {
+    clearTimeout(timeoutId);
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const contentType = response.headers.get('content-type');
+    if (!contentType || !contentType.includes('application/json')) {
+        throw new Error('La réponse n\'est pas au format JSON');
+    }
+    return response.json();
+})
+.then(data => {
+    // Traiter la réponse
+    console.log('Succès:', data);
+})
+.catch(error => {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+        alert('Timeout: La recherche prend trop de temps');
+    } else {
+        console.error('Erreur:', error);
+        alert('Une erreur est survenue: ' + error.message);
+    }
+});
