@@ -27,18 +27,18 @@ os.environ['TFHUB_CACHE_DIR'] = os.path.join(os.getcwd(), 'models', 'tfhub_cache
 # Configuration de l'application
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'static/uploads'
-app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # Réduit à 8 MB
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 app.config['EMBEDDINGS_PATH'] = 'data/embeddings.pkl'
 app.config['NPY_EMBEDDINGS_PATH'] = 'data/embeddings.npy'
 app.config['METADATA_PATH'] = 'data/luminaires.json'
-app.config['DEFAULT_NUM_RESULTS'] = 6  # Réduit pour économiser la mémoire
+app.config['DEFAULT_NUM_RESULTS'] = 6
 app.config['MODEL_PATH'] = 'models/efficientnet_v2_model'
 
 # Création du dossier d'upload s'il n'existe pas
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Configuration du logging
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Variables globales pour les modèles et données
@@ -47,39 +47,72 @@ metadata = None
 embedding_model = None
 nn_model = None
 data_loaded = False
+model_loaded = False
 
 def cleanup_memory():
     """Force le nettoyage de la mémoire"""
     gc.collect()
 
-def load_data():
-    global embeddings, metadata, embedding_model, nn_model, data_loaded
-
-    if data_loaded:
-        return embeddings, metadata, nn_model
-
-    # Chargement du modèle
-    logger.info("Chargement du modèle d'embedding...")
+def load_embedding_model():
+    """Charge le modèle d'embedding de manière robuste"""
+    global embedding_model, model_loaded
+    
+    if model_loaded and embedding_model is not None:
+        return True
+        
+    logger.info("Tentative de chargement du modèle d'embedding...")
+    
     try:
         # D'abord essayer de charger le modèle préenregistré
         if os.path.exists(app.config['MODEL_PATH']):
             logger.info("Chargement du modèle préenregistré...")
             embedding_model = tf.keras.models.load_model(app.config['MODEL_PATH'])
             logger.info("Modèle préenregistré chargé avec succès")
-        else:
-            # Fallback: charger depuis TF Hub
-            logger.info("Modèle préenregistré non trouvé, téléchargement depuis TF Hub...")
-            import tensorflow_hub as hub
-            model_url = "https://tfhub.dev/google/imagenet/efficientnet_v2_imagenet21k_b3/feature_vector/2"
-            embedding_model = hub.KerasLayer(model_url)
-            logger.info("Modèle téléchargé avec succès")
+            model_loaded = True
+            return True
             
-        # Nettoyage après chargement du modèle
+    except Exception as e:
+        logger.warning(f"Échec du chargement du modèle préenregistré: {e}")
+        embedding_model = None
+    
+    # Fallback: charger depuis TF Hub
+    try:
+        logger.info("Téléchargement du modèle depuis TF Hub...")
+        import tensorflow_hub as hub
+        
+        # Utiliser une URL plus simple et plus fiable
+        model_url = "https://tfhub.dev/google/imagenet/efficientnet_v2_imagenet21k_b0/feature_vector/2"
+        
+        # Créer le modèle avec une couche hub
+        embedding_model = tf.keras.Sequential([
+            hub.KerasLayer(model_url, trainable=False)
+        ])
+        
+        # Compiler le modèle pour s'assurer qu'il fonctionne
+        embedding_model.build([None, 224, 224, 3])
+        
+        logger.info("Modèle TF Hub chargé et compilé avec succès")
+        model_loaded = True
         cleanup_memory()
+        return True
         
     except Exception as e:
-        logger.error(f"Erreur lors du chargement du modèle: {e}")
-        traceback.print_exc()
+        logger.error(f"Échec du chargement depuis TF Hub: {e}")
+        logger.error(traceback.format_exc())
+        embedding_model = None
+        model_loaded = False
+        return False
+
+def load_data():
+    """Charge toutes les données nécessaires"""
+    global embeddings, metadata, nn_model, data_loaded
+
+    if data_loaded:
+        return embeddings, metadata, nn_model
+
+    # Chargement du modèle d'embedding
+    if not load_embedding_model():
+        logger.error("Impossible de charger le modèle d'embedding")
         return None, None, None
 
     # Chargement des embeddings
@@ -98,7 +131,7 @@ def load_data():
             return None, None, None
             
         # Limiter le dataset pour économiser la mémoire
-        if len(embeddings) > 500:  # Limite réduite
+        if len(embeddings) > 500:
             embeddings = embeddings[:500]
             logger.info(f"Dataset limité à {len(embeddings)} éléments")
             
@@ -136,6 +169,7 @@ def load_data():
 
     data_loaded = True
     cleanup_memory()
+    logger.info("Chargement des données terminé avec succès")
     return embeddings, metadata, nn_model
 
 def get_data():
@@ -147,17 +181,20 @@ def process_image(image_path, target_size=(224, 224)):
     Traite une image et extrait ses caractéristiques avec le modèle d'embedding
     """
     try:
+        # Vérifier que le modèle est chargé
+        if embedding_model is None or not model_loaded:
+            logger.error("Modèle d'embedding non chargé")
+            # Tenter de recharger le modèle
+            if not load_embedding_model():
+                return None
+        
         # Charger et préprocesser l'image
         image = Image.open(image_path).convert('RGB')
         image = image.resize(target_size)
-        image_array = np.array(image) / 255.0
+        image_array = np.array(image, dtype=np.float32) / 255.0
         image_batch = np.expand_dims(image_array, axis=0)
         
         # Obtenir les embeddings
-        if embedding_model is None:
-            logger.error("Modèle d'embedding non chargé")
-            return None
-            
         features = embedding_model(image_batch)
         features = features.numpy().flatten()
         
@@ -168,6 +205,7 @@ def process_image(image_path, target_size=(224, 224)):
         
     except Exception as e:
         logger.error(f"Erreur lors du traitement de l'image {image_path}: {e}")
+        logger.error(traceback.format_exc())
         return None
 
 @app.route('/')
@@ -191,7 +229,7 @@ def search_images():
 
         # Obtenir le nombre de résultats demandés
         num_results = int(request.form.get('num_results', app.config['DEFAULT_NUM_RESULTS']))
-        num_results = min(num_results, 12)  # Limiter à 12 max
+        num_results = min(num_results, 12)
 
         # Sauvegarder l'image temporairement
         filename = secure_filename(f"{uuid.uuid4()}{os.path.splitext(file.filename)[1]}")
@@ -202,7 +240,7 @@ def search_images():
             # Traiter l'image et extraire les caractéristiques
             query_features = process_image(filepath)
             if query_features is None:
-                return jsonify({'error': 'Impossible de traiter cette image'}), 400
+                return jsonify({'error': 'Impossible de traiter cette image. Modèle non disponible.'}), 500
 
             # Obtenir les données nécessaires pour la recherche
             embeddings, metadata, nn_model = get_data()
@@ -230,6 +268,8 @@ def search_images():
             query_image_url = f"/uploads/{filename}"
             processing_time = time.time() - start_time
             
+            logger.info(f"Recherche effectuée en {processing_time:.2f}s avec {len(results)} résultats")
+            
             return jsonify({
                 'query_image': query_image_url,
                 'results': results,
@@ -248,7 +288,7 @@ def search_images():
     except Exception as e:
         logger.error(f"Erreur lors de la recherche: {e}")
         logger.error(traceback.format_exc())
-        return jsonify({'error': 'Erreur interne du serveur'}), 500
+        return jsonify({'error': f'Erreur interne du serveur: {str(e)}'}), 500
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
@@ -264,12 +304,25 @@ def health_check():
     try:
         return jsonify({
             'status': 'healthy',
-            'model_loaded': embedding_model is not None,
-            'data_loaded': data_loaded
+            'model_loaded': model_loaded,
+            'data_loaded': data_loaded,
+            'embedding_model_available': embedding_model is not None
         })
-    except:
-        return jsonify({'status': 'unhealthy'}), 500
+    except Exception as e:
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+
+# Initialisation au démarrage pour Gunicorn
+def init_app():
+    """Initialise l'application au démarrage"""
+    try:
+        logger.info("Initialisation de l'application...")
+        # Charger les données au démarrage
+        load_data()
+        logger.info("Application initialisée avec succès!")
+    except Exception as e:
+        logger.error(f"Erreur lors de l'initialisation: {e}")
 
 if __name__ == '__main__':
+    init_app()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
