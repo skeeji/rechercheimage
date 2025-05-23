@@ -20,11 +20,9 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 tf.config.threading.set_inter_op_parallelism_threads(1)
 tf.config.threading.set_intra_op_parallelism_threads(1)
 
-# Désactiver l'optimisation JIT qui consomme de la mémoire
-tf.config.optimizer.set_jit(False)
-
 # Configuration de l'environnement
 load_dotenv()
+os.environ['TFHUB_CACHE_DIR'] = os.path.join(os.getcwd(), 'models', 'tfhub_cache')
 
 # Configuration de l'application
 app = Flask(__name__)
@@ -33,14 +31,14 @@ app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # Réduit à 8 MB
 app.config['EMBEDDINGS_PATH'] = 'data/embeddings.pkl'
 app.config['NPY_EMBEDDINGS_PATH'] = 'data/embeddings.npy'
 app.config['METADATA_PATH'] = 'data/luminaires.json'
-app.config['DEFAULT_NUM_RESULTS'] = 6  # Réduit de 12 à 6
+app.config['DEFAULT_NUM_RESULTS'] = 6  # Réduit pour économiser la mémoire
 app.config['MODEL_PATH'] = 'models/efficientnet_v2_model'
 
 # Création du dossier d'upload s'il n'existe pas
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Configuration du logging
-logging.basicConfig(level=logging.ERROR)  # Changé à ERROR pour réduire les logs
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
 # Variables globales pour les modèles et données
@@ -53,122 +51,123 @@ data_loaded = False
 def cleanup_memory():
     """Force le nettoyage de la mémoire"""
     gc.collect()
-    if hasattr(tf.keras.backend, 'clear_session'):
-        tf.keras.backend.clear_session()
 
-def load_model_lightweight():
-    """Charge un modèle plus léger"""
-    global embedding_model
-    
-    if embedding_model is not None:
-        return embedding_model
-    
+def load_data():
+    global embeddings, metadata, embedding_model, nn_model, data_loaded
+
+    if data_loaded:
+        return embeddings, metadata, nn_model
+
+    # Chargement du modèle
+    logger.info("Chargement du modèle d'embedding...")
     try:
-        # Utiliser un modèle plus léger - MobileNetV2
-        from tensorflow.keras.applications import MobileNetV2
-        from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-        
-        logger.info("Chargement de MobileNetV2 (léger)...")
-        base_model = MobileNetV2(
-            weights='imagenet',
-            include_top=False,
-            pooling='avg',
-            input_shape=(224, 224, 3)
-        )
-        
-        # Geler les couches pour économiser la mémoire
-        base_model.trainable = False
-        
-        embedding_model = base_model
-        logger.info("Modèle léger chargé avec succès")
-        
-        # Nettoyer immédiatement
+        # D'abord essayer de charger le modèle préenregistré
+        if os.path.exists(app.config['MODEL_PATH']):
+            logger.info("Chargement du modèle préenregistré...")
+            embedding_model = tf.keras.models.load_model(app.config['MODEL_PATH'])
+            logger.info("Modèle préenregistré chargé avec succès")
+        else:
+            # Fallback: charger depuis TF Hub
+            logger.info("Modèle préenregistré non trouvé, téléchargement depuis TF Hub...")
+            import tensorflow_hub as hub
+            model_url = "https://tfhub.dev/google/imagenet/efficientnet_v2_imagenet21k_b3/feature_vector/2"
+            embedding_model = hub.KerasLayer(model_url)
+            logger.info("Modèle téléchargé avec succès")
+            
+        # Nettoyage après chargement du modèle
         cleanup_memory()
-        
-        return embedding_model
         
     except Exception as e:
         logger.error(f"Erreur lors du chargement du modèle: {e}")
-        raise
+        traceback.print_exc()
+        return None, None, None
 
-def load_data_optimized():
-    """Chargement optimisé des données"""
-    global embeddings, metadata, nn_model, data_loaded
-    
-    if data_loaded:
-        return
-    
+    # Chargement des embeddings
+    logger.info("Chargement des embeddings...")
     try:
-        logger.info("Chargement des données...")
-        
-        # Charger les embeddings (limiter la taille)
         if os.path.exists(app.config['NPY_EMBEDDINGS_PATH']):
             embeddings = np.load(app.config['NPY_EMBEDDINGS_PATH'])
-        else:
+            logger.info(f"Embeddings .npy chargés: {embeddings.shape}")
+        elif os.path.exists(app.config['EMBEDDINGS_PATH']):
             with open(app.config['EMBEDDINGS_PATH'], 'rb') as f:
                 embeddings = pickle.load(f)
-        
-        # Limiter le nombre d'embeddings si trop important
-        if len(embeddings) > 1000:
-            logger.info("Limitation du dataset pour économiser la mémoire")
-            embeddings = embeddings[:1000]
-        
-        # Charger les métadonnées correspondantes
-        with open(app.config['METADATA_PATH'], 'r', encoding='utf-8') as f:
-            metadata = json.load(f)
-        
-        # Limiter les métadonnées aussi
-        if len(metadata) > len(embeddings):
-            metadata = metadata[:len(embeddings)]
-        
-        # Modèle NN avec moins de voisins
-        nn_model = NearestNeighbors(metric='cosine', n_jobs=1)
-        nn_model.fit(embeddings)
-        
-        data_loaded = True
-        logger.info(f"Données chargées: {len(embeddings)} éléments")
-        
-        # Nettoyer la mémoire
-        cleanup_memory()
-        
+            embeddings = np.array(embeddings)
+            logger.info(f"Embeddings .pkl chargés: {embeddings.shape}")
+        else:
+            logger.error("Aucun fichier d'embeddings trouvé")
+            return None, None, None
+            
+        # Limiter le dataset pour économiser la mémoire
+        if len(embeddings) > 500:  # Limite réduite
+            embeddings = embeddings[:500]
+            logger.info(f"Dataset limité à {len(embeddings)} éléments")
+            
     except Exception as e:
-        logger.error(f"Erreur lors du chargement des données: {e}")
-        raise
+        logger.error(f"Erreur lors du chargement des embeddings: {e}")
+        return None, None, None
 
-def process_image_lightweight(image_path, target_size=(224, 224)):
-    """Version optimisée du traitement d'image"""
+    # Chargement des métadonnées
+    logger.info("Chargement des métadonnées...")
     try:
-        # Charger le modèle à la demande
-        model = load_model_lightweight()
+        if os.path.exists(app.config['METADATA_PATH']):
+            with open(app.config['METADATA_PATH'], 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            
+            # Synchroniser avec les embeddings limités
+            if len(metadata) > len(embeddings):
+                metadata = metadata[:len(embeddings)]
+                
+            logger.info(f"Métadonnées chargées: {len(metadata)} éléments")
+        else:
+            logger.error("Fichier de métadonnées non trouvé")
+            return None, None, None
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement des métadonnées: {e}")
+        return None, None, None
+
+    # Création du modèle de recherche
+    try:
+        nn_model = NearestNeighbors(n_neighbors=min(20, len(embeddings)), metric='cosine')
+        nn_model.fit(embeddings)
+        logger.info("Modèle de recherche créé avec succès")
+    except Exception as e:
+        logger.error(f"Erreur lors de la création du modèle de recherche: {e}")
+        return None, None, None
+
+    data_loaded = True
+    cleanup_memory()
+    return embeddings, metadata, nn_model
+
+def get_data():
+    """Fonction utilitaire pour obtenir les données chargées"""
+    return load_data()
+
+def process_image(image_path, target_size=(224, 224)):
+    """
+    Traite une image et extrait ses caractéristiques avec le modèle d'embedding
+    """
+    try:
+        # Charger et préprocesser l'image
+        image = Image.open(image_path).convert('RGB')
+        image = image.resize(target_size)
+        image_array = np.array(image) / 255.0
+        image_batch = np.expand_dims(image_array, axis=0)
         
-        # Traitement de l'image
-        img = Image.open(image_path).convert('RGB')
-        img = img.resize(target_size, Image.Resampling.LANCZOS)
+        # Obtenir les embeddings
+        if embedding_model is None:
+            logger.error("Modèle d'embedding non chargé")
+            return None
+            
+        features = embedding_model(image_batch)
+        features = features.numpy().flatten()
         
-        # Preprocessing pour MobileNetV2
-        img_array = np.array(img)
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-        img_array = preprocess_input(img_array)
-        
-        # Prédiction
-        features = model.predict(img_array, verbose=0, batch_size=1)
-        features = features.flatten()
-        
-        # Normalisation
-        norm = np.linalg.norm(features)
-        if norm > 0:
-            features = features / norm
-        
-        # Nettoyer
-        del img, img_array
+        # Nettoyage
         cleanup_memory()
         
         return features
         
     except Exception as e:
-        logger.error(f"Erreur de traitement d'image: {e}")
+        logger.error(f"Erreur lors du traitement de l'image {image_path}: {e}")
         return None
 
 @app.route('/')
@@ -176,52 +175,58 @@ def index():
     return render_template('index.html')
 
 @app.route('/api/search', methods=['POST'])
-def search():
+def search_images():
+    start_time = time.time()
+    
     try:
-        start_time = time.time()
+        logger.info("Début de la recherche...")
         
-        # Vérifications basiques
+        # Vérifier qu'un fichier a été envoyé
         if 'image' not in request.files:
-            return jsonify({'error': 'Aucune image fournie'}), 400
+            return jsonify({'error': 'Aucun fichier envoyé'}), 400
         
         file = request.files['image']
         if file.filename == '':
-            return jsonify({'error': 'Nom de fichier vide'}), 400
-        
-        # Limiter le nombre de résultats
-        try:
-            num_results = min(int(request.form.get('num_results', 6)), 6)
-        except:
-            num_results = 6
-        
-        # Sauvegarder l'image
+            return jsonify({'error': 'Aucun fichier sélectionné'}), 400
+
+        # Obtenir le nombre de résultats demandés
+        num_results = int(request.form.get('num_results', app.config['DEFAULT_NUM_RESULTS']))
+        num_results = min(num_results, 12)  # Limiter à 12 max
+
+        # Sauvegarder l'image temporairement
         filename = secure_filename(f"{uuid.uuid4()}{os.path.splitext(file.filename)[1]}")
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
-        
+
         try:
-            # Charger les données si nécessaire
-            load_data_optimized()
-            
-            # Traitement de l'image
-            query_features = process_image_lightweight(filepath)
+            # Traiter l'image et extraire les caractéristiques
+            query_features = process_image(filepath)
             if query_features is None:
                 return jsonify({'error': 'Impossible de traiter cette image'}), 400
+
+            # Obtenir les données nécessaires pour la recherche
+            embeddings, metadata, nn_model = get_data()
             
-            # Recherche
+            if embeddings is None or metadata is None or nn_model is None:
+                return jsonify({'error': 'Les données de recherche ne sont pas disponibles'}), 500
+            
+            # Recherche des plus proches voisins
             num_neighbors = min(num_results, len(embeddings))
             distances, indices = nn_model.kneighbors([query_features], n_neighbors=num_neighbors)
-            
-            # Résultats
+
+            # Préparer les résultats
             results = []
             for i, idx in enumerate(indices[0]):
-                item = metadata[idx].copy()
-                if 'image_path' in item:
-                    image_name = os.path.basename(item['image_path'])
-                    item['image_url'] = f"/images/{image_name}"
-                item['similarity'] = float(1 - distances[0][i])
-                results.append(item)
-            
+                if idx < len(metadata):
+                    item = metadata[idx].copy()
+
+                    if 'image_path' in item:
+                        image_name = os.path.basename(item['image_path'])
+                        item['image_url'] = f"/images/{image_name}"
+                    
+                    item['similarity'] = float(1 - distances[0][i])
+                    results.append(item)
+
             query_image_url = f"/uploads/{filename}"
             processing_time = time.time() - start_time
             
@@ -233,17 +238,17 @@ def search():
             })
             
         finally:
-            # Nettoyer le fichier temporaire
+            # Nettoyage du fichier temporaire
             try:
                 if os.path.exists(filepath):
                     os.remove(filepath)
             except:
                 pass
-            cleanup_memory()
     
     except Exception as e:
         logger.error(f"Erreur lors de la recherche: {e}")
-        return jsonify({'error': f'Erreur de traitement: {str(e)}'}), 500
+        logger.error(traceback.format_exc())
+        return jsonify({'error': 'Erreur interne du serveur'}), 500
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
@@ -253,13 +258,17 @@ def uploaded_file(filename):
 def database_image(filename):
     return send_from_directory('data/images', filename)
 
-@app.route('/results')
-def results():
-    return render_template('results.html')
-
 @app.route('/health')
-def health():
-    return jsonify({'status': 'ok'})
+def health_check():
+    """Endpoint de santé pour le monitoring"""
+    try:
+        return jsonify({
+            'status': 'healthy',
+            'model_loaded': embedding_model is not None,
+            'data_loaded': data_loaded
+        })
+    except:
+        return jsonify({'status': 'unhealthy'}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
