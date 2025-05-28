@@ -35,7 +35,7 @@ def ensure_initialized():
             test_output = embedding_model(tf.constant(np.random.rand(1, 224, 224, 3), dtype=tf.float32))
             logging.info(f"✅ Modèle chargé, dimensions: {test_output.shape}")
 
-        embeddings_path = 'data/embeddings.npy'
+        embeddings_path = 'models/embeddings2.npy'
         if not os.path.exists(embeddings_path):
             logging.error("❌ Fichier embeddings.npy manquant")
             return False
