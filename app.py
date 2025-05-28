@@ -45,8 +45,8 @@ def ensure_initialized():
             logging.info(f"✅ Embeddings chargés: {luminaire_embeddings.shape}")
 
         if luminaire_metadata is None:
-            metadata_pkl_path = 'data/embeddings.pkl'
-            metadata_json_path = 'data/luminaires.json'
+            metadata_pkl_path = 'models/embeddings2.pkl'
+            metadata_json_path = 'models/luminaires2.json'
             
             if os.path.exists(metadata_pkl_path):
                 try:
