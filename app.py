@@ -1,231 +1,267 @@
-import os
-import pickle
-import json
+from flask import Flask, request, jsonify, render_template, send_file
 import numpy as np
 from PIL import Image
+import tensorflow_hub as hub
 import tensorflow as tf
-from flask import Flask, request, jsonify, render_template, send_from_directory
-from werkzeug.utils import secure_filename
-from sklearn.neighbors import NearestNeighbors
-import time
-import uuid
-import traceback
+import os
+import json
+import pickle
 import logging
-from dotenv import load_dotenv
 
-# Configuration de l'environnement
-load_dotenv()
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Supprimer les messages TF
-os.environ['TFHUB_CACHE_DIR'] = os.path.join(os.getcwd(), 'models', 'tfhub_cache')
+# Configuration des logs
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 
-# Configuration de l'application
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'static/uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max
-app.config['EMBEDDINGS_PATH'] = 'data/embeddings.pkl'
-app.config['NPY_EMBEDDINGS_PATH'] = 'data/embeddings.npy'
-app.config['METADATA_PATH'] = 'data/luminaires.json'
-app.config['DEFAULT_NUM_RESULTS'] = 12
-app.config['MODEL_PATH'] = 'models/efficientnet_v2_model'
 
-# Création du dossier d'upload s'il n'existe pas
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-# Configuration du logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Variables globales pour les modèles et données
-embeddings = None
-metadata = None
 embedding_model = None
-nn_model = None
+luminaire_embeddings = None
+luminaire_metadata = None
+is_loaded = False
 
-# Chargement des embeddings et des métadonnées
-def load_data():
-    global embeddings, metadata, embedding_model, nn_model
-
-    # Chargement du modèle
-    logger.info("Chargement du modèle d'embedding...")
-    try:
-        # D'abord essayer de charger le modèle préenregistré
-        if os.path.exists(app.config['MODEL_PATH']):
-            logger.info("Chargement du modèle préenregistré...")
-            embedding_model = tf.keras.models.load_model(app.config['MODEL_PATH'])
-            logger.info("Modèle préenregistré chargé avec succès")
-        else:
-            # Fallback: charger depuis TF Hub
-            logger.info("Modèle préenregistré non trouvé, téléchargement depuis TF Hub...")
-            import tensorflow_hub as hub
-            model_url = "https://tfhub.dev/google/imagenet/efficientnet_v2_imagenet21k_b3/feature_vector/2"
-            embedding_model = hub.KerasLayer(model_url)
-            logger.info("Modèle téléchargé avec succès")
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement du modèle: {e}")
-        logger.error(traceback.format_exc())
-        raise
-
-    logger.info("Chargement des features et metadata...")
-    start_time = time.time()
-
-    try:
-        # Essayer de charger les embeddings au format NPY (plus rapide)
-        if os.path.exists(app.config['NPY_EMBEDDINGS_PATH']):
-            logger.info("Chargement des embeddings NPY...")
-            embeddings = np.load(app.config['NPY_EMBEDDINGS_PATH'])
-        else:
-            # Fallback: charger au format PKL
-            logger.info("Chargement des embeddings PKL...")
-            with open(app.config['EMBEDDINGS_PATH'], 'rb') as f:
-                embeddings = pickle.load(f)
+def ensure_initialized():
+    global embedding_model, luminaire_embeddings, luminaire_metadata, is_loaded
+    
+    # 🔧 CORRECTIF: vérification explicite avec 'is not None'
+    if embedding_model is not None and luminaire_embeddings is not None and luminaire_metadata is not None:
+        return True
         
-        logger.info(f"Nombre d'embeddings chargés: {len(embeddings)}")
-        logger.info(f"Dimension des embeddings: {embeddings.shape}")
-
-        with open(app.config['METADATA_PATH'], 'r', encoding='utf-8') as f:
-            metadata = json.load(f)
-            logger.info(f"Nombre d'éléments dans metadata: {len(metadata)}")
-
-        # Préparation du modèle de recherche des plus proches voisins
-        nn_model = NearestNeighbors(metric='cosine')
-        nn_model.fit(embeddings)
-        logger.info("Modèle de recherche initialisé")
-        
-        logger.info(f"Données chargées en {time.time() - start_time:.2f} secondes")
-
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement des données: {e}")
-        logger.error(traceback.format_exc())
-        embeddings = None
-        metadata = None
-        raise
-
-# Fonction pour obtenir le modèle (chargé à la demande)
-def get_model():
-    global embedding_model
-    if embedding_model is None:
-        load_data()
-    return embedding_model
-
-# Fonction pour obtenir les données (chargées à la demande)
-def get_data():
-    global embeddings, metadata, nn_model
-    if embeddings is None or metadata is None or nn_model is None:
-        load_data()
-    return embeddings, metadata, nn_model
-
-# Fonction pour traiter l'image et extraire l'embedding
-def process_image(image_path, target_size=(224, 224)):
     try:
-        # Utiliser la même méthode de traitement que dans le script de génération
-        img = Image.open(image_path).convert('RGB')
-        img = img.resize(target_size)
-        img_array = np.array(img) / 255.0
-        img_batch = np.expand_dims(img_array, axis=0)
-
-        model = get_model()
-        features = model(img_batch).numpy().flatten()
+        logging.info("🔄 Initialisation...")
         
-        # Normaliser le vecteur comme dans le script de génération
-        norm = np.linalg.norm(features)
-        if norm > 0:
-            features = features / norm
+        if embedding_model is None:
+            logging.info("📥 Chargement MobileNet...")
+            embedding_model = hub.load("https://tfhub.dev/google/tf2-preview/mobilenet_v2/feature_vector/4")
+            # Test du modèle
+            test_output = embedding_model(tf.constant(np.random.rand(1, 224, 224, 3), dtype=tf.float32))
+            logging.info(f"✅ Modèle chargé, dimensions: {test_output.shape}")
 
-        return features
+        embeddings_path = 'data/embeddings.npy'
+        if not os.path.exists(embeddings_path):
+            logging.error("❌ Fichier embeddings.npy manquant")
+            return False
+        
+        if luminaire_embeddings is None:
+            luminaire_embeddings = np.load(embeddings_path)
+            logging.info(f"✅ Embeddings chargés: {luminaire_embeddings.shape}")
+
+        if luminaire_metadata is None:
+            metadata_pkl_path = 'data/embeddings.pkl'
+            metadata_json_path = 'data/luminaires.json'
+            
+            if os.path.exists(metadata_pkl_path):
+                try:
+                    with open(metadata_pkl_path, 'rb') as f:
+                        luminaire_metadata = pickle.load(f)
+                    logging.info(f"✅ Métadonnées PKL: {len(luminaire_metadata)} items")
+                except Exception as e:
+                    logging.warning(f"⚠️ Erreur PKL: {e}")
+                    luminaire_metadata = None
+                    
+            if luminaire_metadata is None and os.path.exists(metadata_json_path):
+                with open(metadata_json_path, 'r', encoding='utf-8') as f:
+                    luminaire_metadata = json.load(f)
+                logging.info(f"✅ Métadonnées JSON: {len(luminaire_metadata)} items")
+                
+            if luminaire_metadata is None:
+                logging.error("❌ Aucune métadonnée trouvée")
+                return False
+
+        is_loaded = True
+        logging.info("🎉 Initialisation complète!")
+        return True
+        
     except Exception as e:
-        logger.error(f"Erreur de traitement d'image: {e}")
-        logger.error(traceback.format_exc())
-        return None
+        logging.error(f"❌ Erreur initialisation: {e}")
+        return False
 
-# Page d'accueil
 @app.route('/')
 def index():
-    return render_template('index.html')
-
-# Route pour la recherche par image
-@app.route('/api/search', methods=['POST'])
-def search():
     try:
-        start_time = time.time()
+        return render_template('index.html')
+    except Exception as e:
+        logging.warning(f"Template manquant: {e}")
+        return jsonify({
+            'message': 'API de recherche de luminaires',
+            'endpoints': {
+                'status': '/status',
+                'search': '/search (POST)',
+                'api_search': '/api/search (POST)'
+            }
+        })
 
-        # Vérifier si l'image est fournie
-        if 'image' not in request.files:
-            return jsonify({'error': 'Aucune image fournie'}), 400
+@app.route('/api')
+def api_info():
+    return jsonify({
+        'message': 'API de recherche de luminaires',
+        'endpoints': {
+            'status': '/status',
+            'search': '/search (POST)',
+            'api_search': '/api/search (POST)'
+        },
+        'version': '1.0',
+        'ready': is_loaded
+    })
 
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({'error': 'Nom de fichier vide'}), 400
-
-        # Obtenir le nombre de résultats souhaités
-        try:
-            num_results = int(request.form.get('num_results', app.config['DEFAULT_NUM_RESULTS']))
-        except:
-            num_results = app.config['DEFAULT_NUM_RESULTS']
-
-        # Sauvegarder l'image téléchargée
-        filename = secure_filename(f"{uuid.uuid4()}{os.path.splitext(file.filename)[1]}")
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-
-        # Traiter l'image et extraire les caractéristiques
-        query_features = process_image(filepath)
-        if query_features is None:
-            return jsonify({'error': 'Impossible de traiter cette image'}), 400
-
-        # Obtenir les données nécessaires pour la recherche
-        embeddings, metadata, nn_model = get_data()
+@app.route('/status')
+def status():
+    model_loaded = embedding_model is not None
+    embeddings_loaded = luminaire_embeddings is not None
+    metadata_loaded = luminaire_metadata is not None
+    initialized = model_loaded and embeddings_loaded and metadata_loaded
+    
+    status_info = {
+        'initialized': initialized,
+        'status': 'ready' if initialized else 'not_ready',
+        'details': {
+            'model_loaded': model_loaded,
+            'embeddings_loaded': embeddings_loaded,
+            'metadata_loaded': metadata_loaded,
+            'embeddings_count': len(luminaire_embeddings) if embeddings_loaded else 0,
+            'metadata_count': len(luminaire_metadata) if metadata_loaded else 0
+        }
+    }
+    
+    # Ajout des dimensions si chargé
+    if embeddings_loaded and model_loaded:
+        status_info['details']['embeddings_shape'] = luminaire_embeddings.shape
         
-        # Recherche des plus proches voisins
-        num_neighbors = min(num_results, len(embeddings))
-        distances, indices = nn_model.kneighbors([query_features], n_neighbors=num_neighbors)
+    return jsonify(status_info)
 
-        # Préparer les résultats
-        results = []
-        for i, idx in enumerate(indices[0]):
-            item = metadata[idx].copy()
+@app.route('/data/images/<filename>')
+def serve_image(filename):
+    path = os.path.join('data', 'images', filename)
+    if os.path.exists(path):
+        return send_file(path, mimetype='image/jpeg')
+    return jsonify({'error': 'Image non trouvée'}), 404
 
-            if 'image_path' in item:
-                image_name = os.path.basename(item['image_path'])
-                item['image_url'] = f"/images/{image_name}"
+@app.route('/search', methods=['POST'])
+def search_similar():
+    """Version optimisée de la recherche avec gestion mémoire"""
+    if not ensure_initialized():
+        return jsonify({'success': False, 'error': 'Système non initialisé'}), 503
+        
+    if 'image' not in request.files or request.files['image'].filename == '':
+        return jsonify({'success': False, 'error': 'Pas d\'image'}), 400
+
+    try:
+        logging.info("🔍 Nouvelle recherche...")
+        
+        # Traitement de l'image
+        image = Image.open(request.files['image'].stream).convert('RGB')
+        image = image.resize((224, 224))
+        image_np = (np.array(image, dtype=np.float32) / 255.0 - 0.5) * 2.0
+        image_batch = np.expand_dims(image_np, axis=0)
+        
+        # Extraction des features
+        query_features = embedding_model(tf.constant(image_batch, dtype=tf.float32))
+        query_embedding = query_features.numpy()[0]  # Shape: (1280,)
+        
+        logging.info(f"Query: {query_embedding.shape}, DB: {luminaire_embeddings.shape}")
+        
+        # 🔧 CORRECTIF DIMENSION MISMATCH
+        if luminaire_embeddings.shape[1] != query_embedding.shape[0]:
+            logging.warning(f"⚠️ Mismatch dimensions: {query_embedding.shape[0]} vs {luminaire_embeddings.shape[1]}")
             
-            item['similarity'] = float(1 - distances[0][i])
-            results.append(item)
+            if luminaire_embeddings.shape[1] > query_embedding.shape[0]:
+                # Tronquer DB aux dimensions du query (1536 → 1280)
+                database_embeddings = luminaire_embeddings[:, :query_embedding.shape[0]]
+                logging.info(f"✅ DB tronquée: {luminaire_embeddings.shape[1]}D → {query_embedding.shape[0]}D")
+            else:
+                # Padding query (cas inverse)
+                padding_size = luminaire_embeddings.shape[1] - query_embedding.shape[0]
+                padding = np.zeros(padding_size, dtype=np.float32)
+                query_embedding = np.concatenate([query_embedding, padding])
+                database_embeddings = luminaire_embeddings
+                logging.info(f"✅ Query paddé: → {query_embedding.shape[0]}D")
+        else:
+            database_embeddings = luminaire_embeddings
+        
+        # Normalisation query
+        norm = np.linalg.norm(query_embedding)
+        if norm > 0:
+            query_embedding = query_embedding / norm
+        
+        # 🔧 CALCUL PAR CHUNKS pour éviter crash mémoire
+        logging.info("📊 Calcul par chunks...")
+        chunk_size = 500  # Traiter 500 embeddings à la fois
+        max_items = min(len(database_embeddings), 5000)  # Limiter à 5000 max
+        similarities = np.zeros(max_items)
+        
+        for i in range(0, max_items, chunk_size):
+            end_idx = min(i + chunk_size, max_items)
+            chunk = database_embeddings[i:end_idx]
+            
+            # Normalisation du chunk
+            norms = np.linalg.norm(chunk, axis=1, keepdims=True)
+            normalized_chunk = np.where(norms > 0, chunk / norms, chunk)
+            
+            # Similarité cosinus
+            similarities[i:end_idx] = np.dot(normalized_chunk, query_embedding)
+            
+            # Log progrès tous les 2000
+            if i % 2000 == 0:
+                logging.info(f"Progrès: {i}/{max_items}")
+        
+        # Top 10 résultats
+        top_indices = np.argsort(similarities)[::-1][:10]
+        
+        results = []
+        for i, idx in enumerate(top_indices):
+            if idx >= len(luminaire_metadata):
+                continue
+                
+            metadata = luminaire_metadata[idx] if isinstance(luminaire_metadata[idx], dict) else {}
+            similarity_score = similarities[idx]
+            
+            result_item = {
+                'rank': i + 1,
+                'similarity': round(max(0, min(100, similarity_score * 100)), 1),
+                'metadata': {
+                    'id': metadata.get('id', str(idx)),
+                    'name': metadata.get('name', f'Luminaire {idx}'),
+                    'description': metadata.get('description', ''),
+                    'price': float(metadata.get('price', 0.0)),
+                    'category': metadata.get('category', ''),
+                    'style': metadata.get('style', ''),
+                    'material': metadata.get('material', ''),
+                    'image_path': metadata.get('image_path', f'data/images/{idx}.jpg')
+                }
+            }
+            results.append(result_item)
 
-        query_image_url = f"/uploads/{filename}"
-
-        processing_time = time.time() - start_time
-        logger.info(f"Recherche effectuée en {processing_time:.2f}s")
+        best_score = results[0]['similarity'] if results else 0
+        logging.info(f"✅ Recherche terminée: {len(results)} résultats, meilleur: {best_score}%")
 
         return jsonify({
-            'query_image': query_image_url,
+            'success': True,
             'results': results,
-            'processing_time': processing_time,
-            'count': len(results)
+            'message': f'{len(results)} résultats',
+            'stats': {
+                'total_searched': max_items,
+                'results_count': len(results),
+                'best_similarity': best_score,
+                'query_dimensions': query_embedding.shape[0],
+                'db_dimensions': database_embeddings.shape[1] if len(database_embeddings) > 0 else 0
+            }
         })
-    
+        
     except Exception as e:
-        logger.error(f"Erreur lors de la recherche: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({'error': str(e)}), 500
+        logging.error(f"❌ Erreur recherche: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': f'Erreur: {str(e)}'}), 500
 
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+@app.route('/api/search', methods=['POST'])
+def api_search_similar():
+    return search_similar()
 
-@app.route('/images/<filename>')
-def database_image(filename):
-    return send_from_directory('data/images', filename)
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'success': False, 'error': 'Route non trouvée'}), 404
 
-@app.route('/results')
-def results():
-    return render_template('results.html')
-
-# Préchargement des données (pour Gunicorn)
-def preload_app():
-    load_data()
-    logger.info("Préchargement terminé, application prête!")
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'success': False, 'error': 'Erreur serveur'}), 500
 
 if __name__ == '__main__':
-    preload_app()  # Préchargement pour le développement local
+    logging.info("🚀 Démarrage du serveur...")
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
