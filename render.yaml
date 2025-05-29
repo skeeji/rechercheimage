@@ -1,9 +1,10 @@
 services:
   - type: web
-    name: recherche-image
+    name: rechercheimage
     runtime: python
+    plan: standard  # ⬅️ AJOUT : Plus de RAM (512MB → 2GB)
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600 --workers 1 --preload
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 1200 --workers 1 --preload --max-requests 50 --memory-limit 1024
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.11
@@ -11,3 +12,9 @@ services:
         value: 10000
       - key: TF_CPP_MIN_LOG_LEVEL
         value: "3"
+      - key: MODEL_TYPE  # ⬅️ NOUVEAU
+        value: "efficientnet_lite"
+      - key: PYTHONUNBUFFERED  # ⬅️ NOUVEAU
+        value: "1"
+      - key: TF_ENABLE_ONEDNN_OPTS  # ⬅️ OPTIMISATION
+        value: "0"
