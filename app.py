@@ -8,7 +8,7 @@ import logging
 import gc
 
 # CONFIGURATION MINIMALE
-logging.basicConfig(level=logging.ERROR)  # Moins de logs
+logging.basicConfig(level=logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 app = Flask(__name__)
@@ -25,7 +25,6 @@ def get_model():
         import tensorflow_hub as hub
         import tensorflow as tf
         
-        # Config mémoire TF ultra-strict
         tf.config.experimental.enable_memory_growth = True
         tf.config.set_soft_device_placement(True)
         
@@ -42,19 +41,60 @@ def get_embeddings():
     return _embeddings_mmap
 
 def get_metadata():
-    """Cached metadata"""
+    """Cached metadata avec VRAIS noms de fichiers GitHub"""
     global _metadata_cache
     if _metadata_cache is None:
         try:
-            with open('models/embeddings2.pkl', 'rb') as f:
-                raw = pickle.load(f)
-            if isinstance(raw, np.ndarray):
-                _metadata_cache = [{'id': f'lum_{i:04d}', 'image_path': f'data/images/luminaire_{i:06d}.jpg'} 
-                                 for i in range(len(raw))]
+            # Lire les vrais noms de fichiers du dossier
+            images_dir = 'data/images'
+            if os.path.exists(images_dir):
+                # Lister tous les fichiers .jpg dans l'ordre
+                real_files = sorted([f for f in os.listdir(images_dir) 
+                                   if f.lower().endswith('.jpg')])
+                logging.error(f"✅ Fichiers trouvés: {len(real_files)}")
+                
+                # Créer métadonnées avec vrais noms
+                _metadata_cache = []
+                for i, filename in enumerate(real_files):
+                    _metadata_cache.append({
+                        'id': f'lum_{i:04d}',
+                        'name': f'Luminaire {filename}',
+                        'image_path': f'data/images/{filename}',  # VRAI nom
+                        'filename': filename
+                    })
+                
+                # Compléter si nécessaire (au cas où il y a plus d'embeddings que d'images)
+                while len(_metadata_cache) < 9056:
+                    i = len(_metadata_cache)
+                    _metadata_cache.append({
+                        'id': f'lum_{i:04d}',
+                        'name': f'Luminaire {i}',
+                        'image_path': f'data/images/placeholder_{i}.jpg',
+                        'filename': f'placeholder_{i}.jpg'
+                    })
             else:
-                _metadata_cache = raw
-        except:
-            _metadata_cache = [{'id': f'lum_{i:04d}'} for i in range(9056)]
+                # Fallback si dossier non trouvé
+                _metadata_cache = []
+                for i in range(9056):
+                    _metadata_cache.append({
+                        'id': f'lum_{i:04d}',
+                        'name': f'Luminaire {i}',
+                        'image_path': f'data/images/image_{i}.jpg',
+                        'filename': f'image_{i}.jpg'
+                    })
+        
+        except Exception as e:
+            logging.error(f"❌ Erreur metadata: {e}")
+            # Super fallback
+            _metadata_cache = []
+            for i in range(9056):
+                _metadata_cache.append({
+                    'id': f'lum_{i:04d}',
+                    'name': f'Luminaire {i}',
+                    'image_path': f'data/images/fallback_{i}.jpg',
+                    'filename': f'fallback_{i}.jpg'
+                })
+        
         logging.error(f"✅ Metadata: {len(_metadata_cache)}")
     return _metadata_cache
 
@@ -63,15 +103,12 @@ def preprocess_minimal(image):
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
-    # Resize simple
     image = image.resize((224, 224), Image.LANCZOS)
-    
-    # Array minimal
     arr = np.array(image, dtype=np.float32) / 255.0
     return np.expand_dims(arr, axis=0)
 
 def cleanup():
-    """Nettoyage agressif"""
+    """Nettoyage mémoire"""
     gc.collect()
     try:
         import tensorflow as tf
@@ -81,103 +118,77 @@ def cleanup():
 
 @app.route('/')
 def index():
-    try:
-        return render_template('index.html')
-    except:
-        return jsonify({'status': 'API active', 'endpoint': '/search'})
-
-@app.route('/status')
-def status():
-    try:
-        embeddings = get_embeddings()
-        metadata = get_metadata()
-        return jsonify({
-            'status': 'ready',
-            'embeddings': embeddings.shape[0],
-            'metadata': len(metadata),
-            'memory_mode': 'ultra_light'
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)}), 500
+    return render_template('index.html')
 
 @app.route('/search', methods=['POST'])
 def search():
-    if 'image' not in request.files:
-        return jsonify({'success': False, 'error': 'No image'}), 400
-    
     try:
         logging.error("🔍 Search starting...")
         
-        # 1. Load image
-        image = Image.open(request.files['image'].stream)
-        image_batch = preprocess_minimal(image)
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'No image'}), 400
         
-        # 2. Get model and extract features
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'Empty file'}), 400
+        
+        # Prétraitement
+        image = Image.open(file.stream)
+        processed = preprocess_minimal(image)
+        
+        # Modèle et embedding
         model = get_model()
         import tensorflow as tf
-        features = model(tf.constant(image_batch)).numpy()[0]
+        query_embedding = model(tf.constant(processed)).numpy()[0]
+        query_norm = np.linalg.norm(query_embedding)
+        if query_norm > 0:
+            query_embedding = query_embedding / query_norm
         
-        # Normalize query
-        norm = np.linalg.norm(features)
-        if norm > 0:
-            features = features / norm
+        # Base de données
+        database_embeddings = get_embeddings()
+        metadata = get_metadata()
         
-        # 3. Get embeddings (memory-mapped)
-        embeddings = get_embeddings()
-        
-        # 4. Search in SMALL batches to save memory
-        batch_size = 100
-        max_search = min(2000, len(embeddings))  # Limite drastique
+        # Recherche par chunks pour économiser RAM
+        max_search = min(2000, len(database_embeddings))
+        chunk_size = 100
         
         best_scores = []
         best_indices = []
         
-        for i in range(0, max_search, batch_size):
-            end_idx = min(i + batch_size, max_search)
+        for start in range(0, max_search, chunk_size):
+            end = min(start + chunk_size, max_search)
+            chunk = np.array(database_embeddings[start:end])
             
-            # Load only this batch
-            batch = embeddings[i:end_idx].copy()
+            # Similarité cosinus
+            similarities = np.dot(chunk, query_embedding)
             
-            # Normalize batch
-            norms = np.linalg.norm(batch, axis=1, keepdims=True)
-            batch = np.where(norms > 0, batch / norms, batch)
+            # Garder les meilleurs de ce chunk
+            for i, sim in enumerate(similarities):
+                if sim > 0.3:  # Seuil minimum
+                    best_scores.append(sim)
+                    best_indices.append(start + i)
             
-            # Cosine similarity
-            scores = np.dot(batch, features)
-            
-            # Keep only top from this batch
-            top_k = min(5, len(scores))
-            top_batch_idx = np.argpartition(scores, -top_k)[-top_k:]
-            
-            for idx in top_batch_idx:
-                if scores[idx] > 0.3:  # Seuil strict
-                    best_scores.append(scores[idx])
-                    best_indices.append(i + idx)
-            
-            # Cleanup this batch
-            del batch
-            if i % 500 == 0:
-                gc.collect()
+            # Cleanup ce chunk
+            del chunk, similarities
+            gc.collect()
         
-        # 5. Final top results
         if best_scores:
-            final_indices = np.argsort(best_scores)[::-1][:10]
-            metadata = get_metadata()
+            # Trier et prendre le top 10
+            sorted_pairs = sorted(zip(best_scores, best_indices), reverse=True)
+            top_pairs = sorted_pairs[:10]
             
             results = []
-            for rank, idx in enumerate(final_indices):
-                real_idx = best_indices[idx]
-                score = best_scores[idx]
-                
-                meta = metadata[real_idx] if real_idx < len(metadata) else {}
+            for rank, (score, idx) in enumerate(top_pairs):
+                meta = metadata[idx] if idx < len(metadata) else {}
                 
                 results.append({
                     'rank': rank + 1,
                     'similarity': round(score * 100, 1),
                     'metadata': {
-                        'id': meta.get('id', f'lum_{real_idx}'),
-                        'name': meta.get('name', f'Luminaire {real_idx}'),
-                        'image_path': meta.get('image_path', f'data/images/luminaire_{real_idx:06d}.jpg')
+                        'id': meta.get('id', f'lum_{idx}'),
+                        'name': meta.get('name', f'Luminaire {idx}'),
+                        'image_path': meta.get('image_path', f'data/images/image_{idx}.jpg'),
+                        'filename': meta.get('filename', f'image_{idx}.jpg')
                     }
                 })
             
@@ -208,10 +219,36 @@ def api_search():
 
 @app.route('/data/images/<filename>')
 def serve_image(filename):
+    """Sert les images du dossier data/images"""
     path = os.path.join('data', 'images', filename)
     if os.path.exists(path):
         return send_file(path)
-    return jsonify({'error': 'Not found'}), 404
+    
+    logging.error(f"❌ Image not found: {filename} at {path}")
+    return jsonify({'error': f'Image not found: {filename}'}), 404
+
+@app.route('/debug/images')
+def debug_images():
+    """Debug: liste les vraies images disponibles"""
+    try:
+        images_dir = 'data/images'
+        if os.path.exists(images_dir):
+            files = [f for f in os.listdir(images_dir) if f.lower().endswith('.jpg')]
+            return jsonify({
+                'directory': images_dir,
+                'exists': True,
+                'count': len(files),
+                'samples': sorted(files)[:20],  # 20 premiers exemples
+                'total_files': len(files)
+            })
+        else:
+            return jsonify({
+                'directory': images_dir,
+                'exists': False,
+                'error': 'Directory not found'
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     logging.error("🚀 Ultra-light server starting...")
