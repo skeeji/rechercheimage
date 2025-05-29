@@ -40,13 +40,12 @@ def ensure_initialized():
         return True
         
     try:
-        logging.info("🔄 Initialisation ALLÉGÉE...")
+        logging.info("🔄 Initialisation CORRIGÉE...")
         
         # Modèle plus léger
         if embedding_model is None:
-            logging.info("📥 Chargement MobileNet LÉGER...")
+            logging.info("📥 Chargement MobileNet...")
             embedding_model = hub.load("https://tfhub.dev/google/tf2-preview/mobilenet_v2/feature_vector/4")
-            # Test rapide
             test_output = embedding_model(tf.constant(np.random.rand(1, 224, 224, 3), dtype=tf.float32))
             logging.info(f"✅ Modèle OK: {test_output.shape}")
             
@@ -54,19 +53,27 @@ def ensure_initialized():
         if luminaire_embeddings is None:
             embeddings_path = 'models/embeddings2.npy'
             if os.path.exists(embeddings_path):
-                # Memory mapping pour économiser RAM
                 luminaire_embeddings = np.load(embeddings_path, mmap_mode='r')
-                logging.info(f"✅ Embeddings mappés: {luminaire_embeddings.shape}")
+                logging.info(f"✅ Embeddings: {luminaire_embeddings.shape}")
             else:
                 logging.error("❌ Fichier embeddings2.npy introuvable")
                 return False
             
-        # Métadonnées
+        # Métadonnées avec diagnostic
         if luminaire_metadata is None:
             metadata_path = 'models/embeddings2.pkl'
             if os.path.exists(metadata_path):
                 with open(metadata_path, 'rb') as f:
                     luminaire_metadata = pickle.load(f)
+                
+                # DIAGNOSTIC du format des métadonnées
+                logging.info(f"📊 Type métadonnées: {type(luminaire_metadata)}")
+                if hasattr(luminaire_metadata, 'shape'):
+                    logging.info(f"📊 Shape métadonnées: {luminaire_metadata.shape}")
+                if isinstance(luminaire_metadata, (list, np.ndarray)) and len(luminaire_metadata) > 0:
+                    sample = luminaire_metadata[0] if len(luminaire_metadata) > 0 else None
+                    logging.info(f"📊 Échantillon métadonnée[0]: {type(sample)} = {sample}")
+                
                 logging.info(f"✅ Métadonnées: {len(luminaire_metadata)} items")
             else:
                 logging.error("❌ Fichier embeddings2.pkl introuvable")
@@ -88,21 +95,11 @@ def index():
 def preprocess_image_optimized(image):
     """Preprocessing allégé et optimisé"""
     try:
-        # Resize efficace
         image = image.resize((224, 224), Image.Resampling.LANCZOS)
-        
-        # Conversion array optimisée
         image_array = np.array(image, dtype=np.float32)
-        
-        # Normalisation [0,1]
         image_array = image_array / 255.0
-        
-        # Normalisation MobileNet [-1,1]
         image_array = (image_array - 0.5) * 2.0
-        
-        # Ajout dimension batch
         return np.expand_dims(image_array, axis=0)
-        
     except Exception as e:
         logging.error(f"❌ Erreur préprocessing: {e}")
         raise
@@ -110,186 +107,157 @@ def preprocess_image_optimized(image):
 @app.route('/search', methods=['POST'])
 def search_similar():
     try:
-        # Vérification initialisation
         if not ensure_initialized():
             return jsonify({'success': False, 'error': 'Modèle non initialisé'}), 503
             
-        # Vérification fichier
         file = request.files.get('image')
         if not file or file.filename == '':
             return jsonify({'success': False, 'error': 'Aucune image fournie'}), 400
             
-        logging.info("🔍 Nouvelle recherche OPTIMISÉE...")
+        logging.info("🔍 Recherche avec métadonnées CORRIGÉES...")
         
-        # Chargement et conversion image
+        # Chargement image
         image = Image.open(file.stream)
-        logging.info(f"📸 Image chargée: {image.size}, mode: {image.mode}")
+        logging.info(f"📸 Image: {image.size}, mode: {image.mode}")
         
         if image.mode != 'RGB':
             image = image.convert('RGB')
-            logging.info("🔄 Conversion en RGB")
             
-        # Preprocessing optimisé
+        # Preprocessing
         image_batch = preprocess_image_optimized(image)
-        logging.info(f"✅ Image préprocessée: {image_batch.shape}")
+        logging.info(f"✅ Préprocessée: {image_batch.shape}")
         
-        # Extraction des features
+        # Extraction features
         query_features = embedding_model(tf.constant(image_batch, dtype=tf.float32))
         query_embedding = query_features.numpy().flatten()
-        logging.info(f"✅ Features extraites: {query_embedding.shape}")
+        logging.info(f"✅ Features: {query_embedding.shape}")
         
-        # Calcul de similarité cosine optimisé
-        # Normalisation des vecteurs
+        # Similarité (version allégée)
         db_norms = np.linalg.norm(luminaire_embeddings, axis=1)
         query_norm = np.linalg.norm(query_embedding)
         
-        # Filtrage des vecteurs nuls
         valid_indices = (db_norms > 1e-8) & (query_norm > 1e-8)
         
         if query_norm < 1e-8:
-            return jsonify({'success': False, 'error': 'Features de requête invalides'}), 400
+            return jsonify({'success': False, 'error': 'Features invalides'}), 400
             
-        # Calcul similarité cosine pour indices valides seulement
         similarities = np.zeros(len(luminaire_embeddings))
         if np.any(valid_indices):
             valid_embeddings = luminaire_embeddings[valid_indices]
             valid_norms = db_norms[valid_indices]
-            
-            # Produit scalaire normalisé
             dot_products = np.dot(valid_embeddings, query_embedding)
             similarities[valid_indices] = dot_products / (valid_norms * query_norm)
         
-        # Seuil adaptatif intelligent
-        valid_similarities = similarities[similarities > 0]
-        if len(valid_similarities) > 0:
-            mean_sim = np.mean(valid_similarities)
-            std_sim = np.std(valid_similarities)
-            adaptive_threshold = max(0.25, mean_sim + 0.3 * std_sim)
+        # Seuil adaptatif plus permissif
+        valid_sims = similarities[similarities > 0]
+        if len(valid_sims) > 0:
+            mean_sim = np.mean(valid_sims)
+            # Seuil plus bas pour avoir des résultats
+            adaptive_threshold = max(0.15, mean_sim - 0.1)
         else:
-            adaptive_threshold = 0.25
+            adaptive_threshold = 0.15
             
-        logging.info(f"🎯 Seuil adaptatif: {adaptive_threshold:.3f}")
+        logging.info(f"🎯 Seuil: {adaptive_threshold:.3f}")
         
-        # Sélection des meilleurs résultats
-        top_k = min(25, len(similarities))
+        # Top résultats
+        top_k = min(30, len(similarities))
         top_indices = np.argpartition(similarities, -top_k)[-top_k:]
         top_indices = top_indices[np.argsort(similarities[top_indices])][::-1]
         
-        # Construction des résultats
+        # Construction résultats CORRIGÉE
         results = []
-        for idx in top_indices:
+        for rank, idx in enumerate(top_indices):
             similarity = float(similarities[idx])
             
             if similarity >= adaptive_threshold:
                 try:
-                    metadata = luminaire_metadata[idx]
+                    # Génération nom de fichier générique
+                    filename = f"luminaire_{idx:06d}.jpg"
                     
-                    # Calcul confidence amélioré
-                    confidence = min(100, max(0, int((similarity - 0.2) * 125)))
+                    # Tentative d'extraction du vrai nom si possible
+                    try:
+                        if isinstance(luminaire_metadata, (list, np.ndarray)) and idx < len(luminaire_metadata):
+                            meta_item = luminaire_metadata[idx]
+                            if isinstance(meta_item, dict) and 'filename' in meta_item:
+                                filename = meta_item['filename']
+                            elif isinstance(meta_item, str):
+                                filename = meta_item if meta_item.endswith(('.jpg', '.jpeg', '.png')) else f"{meta_item}.jpg"
+                    except Exception as meta_error:
+                        logging.debug(f"Métadonnée non accessible pour {idx}: {meta_error}")
                     
-                    # Qualité basée sur similarity
-                    if similarity >= 0.8:
-                        quality = 'excellent'
-                        quality_score = 95
-                    elif similarity >= 0.65:
-                        quality = 'very_good'
-                        quality_score = 85
+                    # Calculs
+                    confidence = min(100, max(0, int((similarity - 0.1) * 111)))
+                    
+                    if similarity >= 0.7:
+                        quality, quality_score = 'excellent', 95
                     elif similarity >= 0.5:
-                        quality = 'good'
-                        quality_score = 75
-                    elif similarity >= 0.35:
-                        quality = 'fair'
-                        quality_score = 60
+                        quality, quality_score = 'good', 75
+                    elif similarity >= 0.3:
+                        quality, quality_score = 'fair', 60
                     else:
-                        quality = 'low'
-                        quality_score = 40
+                        quality, quality_score = 'low', 40
+                    
+                    # Construction URL
+                    base_name = filename.replace('.jpg', '').replace('.jpeg', '').replace('.png', '')
                     
                     result = {
-                        'filename': metadata.get('filename', f'image_{idx}.jpg'),
+                        'filename': filename,
                         'similarity': round(similarity, 4),
                         'confidence': confidence,
                         'quality': quality,
                         'quality_score': quality_score,
-                        'url': f"/static/compressed/{metadata.get('filename', f'img_{idx}.jpg')}",
-                        'index': int(idx)
+                        'url': f"/static/compressed/{base_name}.jpg",
+                        'index': int(idx),
+                        'rank': rank + 1
                     }
                     
                     results.append(result)
+                    logging.info(f"✅ #{len(results)}: {filename} ({similarity:.3f})")
                     
                 except Exception as e:
-                    logging.warning(f"⚠️ Erreur métadonnées index {idx}: {e}")
+                    logging.warning(f"⚠️ Erreur index {idx}: {e}")
                     continue
                     
-            # Limite pour performance
-            if len(results) >= 15:
+            if len(results) >= 12:  # Limite
                 break
         
-        # Tri final par similarity
-        results.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        # Nettoyage mémoire
         cleanup_memory()
         
-        # Statistiques
         best_score = max([r['similarity'] for r in results], default=0)
         avg_confidence = np.mean([r['confidence'] for r in results]) if results else 0
         
-        logging.info(f"✅ Trouvé {len(results)} résultats, meilleur: {best_score:.3f}")
+        logging.info(f"🎉 {len(results)} résultats, meilleur: {best_score:.3f}")
         
         return jsonify({
             'success': True,
             'results': results,
             'query_info': {
                 'total_database': len(luminaire_embeddings),
-                'valid_database': int(np.sum(valid_indices)),
                 'results_found': len(results),
                 'best_similarity': round(best_score, 4),
                 'avg_confidence': round(avg_confidence, 1),
                 'adaptive_threshold': round(adaptive_threshold, 3),
-                'query_norm': round(float(query_norm), 3),
-                'feature_dims': int(query_embedding.shape[0])
+                'metadata_type': str(type(luminaire_metadata).__name__)
             }
         })
         
     except Exception as e:
         cleanup_memory()
-        logging.error(f"❌ Erreur recherche: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': f'Erreur système: {str(e)}'}), 500
-
-@app.route('/api/search', methods=['POST'])
-def api_search_similar():
-    """Endpoint API pour recherche"""
-    return search_similar()
+        logging.error(f"❌ Erreur: {e}")
+        return jsonify({'success': False, 'error': f'Erreur: {str(e)}'}), 500
 
 @app.route('/health')
 def health_check():
-    """Endpoint de santé"""
     try:
         is_ready = all(x is not None for x in [embedding_model, luminaire_embeddings, luminaire_metadata])
         return jsonify({
-            'status': 'healthy' if is_ready else 'initializing',
-            'model_loaded': embedding_model is not None,
-            'embeddings_loaded': luminaire_embeddings is not None,
-            'metadata_loaded': luminaire_metadata is not None,
+            'status': 'ready' if is_ready else 'loading',
             'database_size': len(luminaire_embeddings) if luminaire_embeddings is not None else 0
         })
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'success': False, 'error': 'Endpoint non trouvé'}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    cleanup_memory()
-    return jsonify({'success': False, 'error': 'Erreur serveur interne'}), 500
-
-@app.errorhandler(413)
-def request_entity_too_large(error):
-    return jsonify({'success': False, 'error': 'Image trop volumineuse (max 16MB)'}), 413
-
 if __name__ == '__main__':
-    logging.info("🚀 Démarrage serveur OPTIMISÉ v2.1...")
+    logging.info("🚀 Version MÉTADONNÉES CORRIGÉES...")
     port = int(os.environ.get('PORT', 5000))
-    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
+    app.run(debug=False, host='0.0.0.0', port=port)
