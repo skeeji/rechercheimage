@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template, send_file
+from flask import Flask, request, jsonify, render_template
 import numpy as np
 from PIL import Image
 import tensorflow_hub as hub
@@ -7,310 +7,289 @@ import os
 import json
 import pickle
 import logging
+import gc
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 
+# Configuration mémoire TensorFlow
+tf.config.set_soft_device_placement(True)
+try:
+    tf.config.experimental.enable_memory_growth = True
+except:
+    pass
+
 app = Flask(__name__)
 
+# Variables globales optimisées
 embedding_model = None
 luminaire_embeddings = None
 luminaire_metadata = None
-is_loaded = False
+
+def cleanup_memory():
+    """Nettoyage mémoire forcé"""
+    gc.collect()
+    try:
+        tf.keras.backend.clear_session()
+    except:
+        pass
 
 def ensure_initialized():
-    global embedding_model, luminaire_embeddings, luminaire_metadata, is_loaded
+    global embedding_model, luminaire_embeddings, luminaire_metadata
     
-    if embedding_model is not None and luminaire_embeddings is not None and luminaire_metadata is not None:
+    if all(x is not None for x in [embedding_model, luminaire_embeddings, luminaire_metadata]):
         return True
         
     try:
-        logging.info("🔄 Initialisation...")
+        logging.info("🔄 Initialisation ALLÉGÉE...")
         
+        # Modèle plus léger
         if embedding_model is None:
-            logging.info("📥 Chargement MobileNet V2 (compatible)...")
-            # RETOUR À MOBILENET MAIS OPTIMISÉ
+            logging.info("📥 Chargement MobileNet LÉGER...")
             embedding_model = hub.load("https://tfhub.dev/google/tf2-preview/mobilenet_v2/feature_vector/4")
+            # Test rapide
             test_output = embedding_model(tf.constant(np.random.rand(1, 224, 224, 3), dtype=tf.float32))
-            logging.info(f"✅ Modèle chargé, dimensions: {test_output.shape}")
-
-        embeddings_path = 'models/embeddings2.npy'
-        if not os.path.exists(embeddings_path):
-            logging.error("❌ Fichier embeddings.npy manquant")
-            return False
-        
-        if luminaire_embeddings is None:
-            luminaire_embeddings = np.load(embeddings_path)
-            logging.info(f"✅ Embeddings chargés: {luminaire_embeddings.shape}")
-
-        if luminaire_metadata is None:
-            metadata_pkl_path = 'models/embeddings2.pkl'
-            metadata_json_path = 'models/luminaires2.json'
+            logging.info(f"✅ Modèle OK: {test_output.shape}")
             
-            if os.path.exists(metadata_pkl_path):
-                try:
-                    with open(metadata_pkl_path, 'rb') as f:
-                        luminaire_metadata = pickle.load(f)
-                    logging.info(f"✅ Métadonnées PKL: {len(luminaire_metadata)} items")
-                except Exception as e:
-                    logging.warning(f"⚠️ Erreur PKL: {e}")
-                    luminaire_metadata = None
-                    
-            if luminaire_metadata is None and os.path.exists(metadata_json_path):
-                with open(metadata_json_path, 'r', encoding='utf-8') as f:
-                    luminaire_metadata = json.load(f)
-                logging.info(f"✅ Métadonnées JSON: {len(luminaire_metadata)} items")
-                
-            if luminaire_metadata is None:
-                logging.error("❌ Aucune métadonnée trouvée")
+        # Embeddings avec memory mapping
+        if luminaire_embeddings is None:
+            embeddings_path = 'models/embeddings2.npy'
+            if os.path.exists(embeddings_path):
+                # Memory mapping pour économiser RAM
+                luminaire_embeddings = np.load(embeddings_path, mmap_mode='r')
+                logging.info(f"✅ Embeddings mappés: {luminaire_embeddings.shape}")
+            else:
+                logging.error("❌ Fichier embeddings2.npy introuvable")
                 return False
-
-        is_loaded = True
+            
+        # Métadonnées
+        if luminaire_metadata is None:
+            metadata_path = 'models/embeddings2.pkl'
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'rb') as f:
+                    luminaire_metadata = pickle.load(f)
+                logging.info(f"✅ Métadonnées: {len(luminaire_metadata)} items")
+            else:
+                logging.error("❌ Fichier embeddings2.pkl introuvable")
+                return False
+        
+        cleanup_memory()
         logging.info("🎉 Initialisation complète!")
         return True
         
     except Exception as e:
         logging.error(f"❌ Erreur initialisation: {e}")
+        cleanup_memory()
         return False
-
-# 🎯 PREPROCESSING OPTIMISÉ POUR LUMINAIRES
-def enhanced_preprocess_image(image):
-    """Preprocessing spécial pour luminaires avec MobileNet optimisé"""
-    try:
-        # Resize optimal
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Resize intelligent avec aspect ratio
-        target_size = (224, 224)
-        image = image.resize(target_size, Image.Resampling.LANCZOS)
-        
-        # Conversion en array
-        img_array = np.array(image, dtype=np.float32)
-        
-        # 🔥 OPTIMISATIONS SPÉCIALES LUMINAIRES
-        # 1. Normalisation améliorée
-        img_array = img_array / 255.0
-        
-        # 2. Amélioration du contraste pour luminaires
-        img_array = np.clip(img_array * 1.1 + 0.05, 0, 1)
-        
-        # 3. Correction gamma pour meilleure détection
-        img_array = np.power(img_array, 0.9)
-        
-        # 4. Normalisation finale MobileNet
-        img_array = (img_array - 0.5) * 2.0
-        
-        # Batch dimension
-        img_batch = np.expand_dims(img_array, axis=0)
-        
-        logging.info(f"✅ Image preprocessée: {img_batch.shape}")
-        return img_batch
-        
-    except Exception as e:
-        logging.error(f"❌ Erreur preprocessing: {e}")
-        return None
-
-# 🔥 SIMILARITÉ HYBRIDE OPTIMISÉE
-def calculate_enhanced_similarity(query_embedding, database_embeddings):
-    """Calcul de similarité hybride optimisé pour luminaires"""
-    try:
-        # Normalisation L2
-        query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
-        db_norms = database_embeddings / (np.linalg.norm(database_embeddings, axis=1, keepdims=True) + 1e-8)
-        
-        # 1. Similarité cosine (poids principal)
-        cosine_sim = np.dot(db_norms, query_norm.T).flatten()
-        
-        # 2. Similarité euclidienne inversée (pour distance)
-        euclidean_dist = np.linalg.norm(db_norms - query_norm, axis=1)
-        euclidean_sim = 1 / (1 + euclidean_dist)
-        
-        # 3. Similarité dot product
-        dot_sim = np.dot(database_embeddings, query_embedding.T).flatten()
-        dot_sim = (dot_sim - np.min(dot_sim)) / (np.max(dot_sim) - np.min(dot_sim) + 1e-8)
-        
-        # 🎯 COMBINAISON OPTIMISÉE POUR LUMINAIRES
-        # Cosine = 60%, Euclidean = 30%, Dot = 10%
-        hybrid_similarity = (
-            0.6 * cosine_sim + 
-            0.3 * euclidean_sim + 
-            0.1 * dot_sim
-        )
-        
-        return hybrid_similarity
-        
-    except Exception as e:
-        logging.error(f"❌ Erreur calcul similarité: {e}")
-        return np.array([])
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+def preprocess_image_optimized(image):
+    """Preprocessing allégé et optimisé"""
+    try:
+        # Resize efficace
+        image = image.resize((224, 224), Image.Resampling.LANCZOS)
+        
+        # Conversion array optimisée
+        image_array = np.array(image, dtype=np.float32)
+        
+        # Normalisation [0,1]
+        image_array = image_array / 255.0
+        
+        # Normalisation MobileNet [-1,1]
+        image_array = (image_array - 0.5) * 2.0
+        
+        # Ajout dimension batch
+        return np.expand_dims(image_array, axis=0)
+        
+    except Exception as e:
+        logging.error(f"❌ Erreur préprocessing: {e}")
+        raise
+
 @app.route('/search', methods=['POST'])
 def search_similar():
     try:
+        # Vérification initialisation
         if not ensure_initialized():
             return jsonify({'success': False, 'error': 'Modèle non initialisé'}), 503
-
-        if 'image' not in request.files:
+            
+        # Vérification fichier
+        file = request.files.get('image')
+        if not file or file.filename == '':
             return jsonify({'success': False, 'error': 'Aucune image fournie'}), 400
-
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({'success': False, 'error': 'Aucun fichier sélectionné'}), 400
-
-        logging.info("🔍 Nouvelle recherche OPTIMISÉE v2.0...")
+            
+        logging.info("🔍 Nouvelle recherche OPTIMISÉE...")
         
-        # Chargement et preprocessing de l'image
-        try:
-            image = Image.open(file.stream)
-            logging.info(f"📸 Image chargée: {image.size}, mode: {image.mode}")
-        except Exception as e:
-            return jsonify({'success': False, 'error': f'Image invalide: {str(e)}'}), 400
-
+        # Chargement et conversion image
+        image = Image.open(file.stream)
+        logging.info(f"📸 Image chargée: {image.size}, mode: {image.mode}")
+        
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+            logging.info("🔄 Conversion en RGB")
+            
         # Preprocessing optimisé
-        image_batch = enhanced_preprocess_image(image)
-        if image_batch is None:
-            return jsonify({'success': False, 'error': 'Erreur preprocessing image'}), 500
-
+        image_batch = preprocess_image_optimized(image)
+        logging.info(f"✅ Image préprocessée: {image_batch.shape}")
+        
         # Extraction des features
-        try:
-            query_features = embedding_model(tf.constant(image_batch, dtype=tf.float32))
-            query_embedding = query_features.numpy().flatten()
-            logging.info(f"✅ Features extraites: {query_embedding.shape}")
-        except Exception as e:
-            logging.error(f"❌ Erreur extraction: {e}")
-            return jsonify({'success': False, 'error': f'Erreur extraction features: {str(e)}'}), 500
-
-        # Calcul similarités hybrides
-        database_embeddings = luminaire_embeddings
-        similarities = calculate_enhanced_similarity(query_embedding, database_embeddings)
+        query_features = embedding_model(tf.constant(image_batch, dtype=tf.float32))
+        query_embedding = query_features.numpy().flatten()
+        logging.info(f"✅ Features extraites: {query_embedding.shape}")
         
-        if len(similarities) == 0:
-            return jsonify({'success': False, 'error': 'Erreur calcul similarités'}), 500
-
-        # 🎯 SEUIL ADAPTATIF INTELLIGENT
-        mean_sim = np.mean(similarities)
-        std_sim = np.std(similarities)
-        max_sim = np.max(similarities)
+        # Calcul de similarité cosine optimisé
+        # Normalisation des vecteurs
+        db_norms = np.linalg.norm(luminaire_embeddings, axis=1)
+        query_norm = np.linalg.norm(query_embedding)
         
-        # Seuil adaptatif basé sur la distribution
-        adaptive_threshold = max(
-            0.15,  # Seuil minimum
-            min(0.50, mean_sim + 0.5 * std_sim),  # Seuil adaptatif
-            max_sim * 0.4  # Minimum 40% du meilleur score
-        )
+        # Filtrage des vecteurs nuls
+        valid_indices = (db_norms > 1e-8) & (query_norm > 1e-8)
         
-        logging.info(f"📊 Stats: mean={mean_sim:.3f}, std={std_sim:.3f}, max={max_sim:.3f}")
+        if query_norm < 1e-8:
+            return jsonify({'success': False, 'error': 'Features de requête invalides'}), 400
+            
+        # Calcul similarité cosine pour indices valides seulement
+        similarities = np.zeros(len(luminaire_embeddings))
+        if np.any(valid_indices):
+            valid_embeddings = luminaire_embeddings[valid_indices]
+            valid_norms = db_norms[valid_indices]
+            
+            # Produit scalaire normalisé
+            dot_products = np.dot(valid_embeddings, query_embedding)
+            similarities[valid_indices] = dot_products / (valid_norms * query_norm)
+        
+        # Seuil adaptatif intelligent
+        valid_similarities = similarities[similarities > 0]
+        if len(valid_similarities) > 0:
+            mean_sim = np.mean(valid_similarities)
+            std_sim = np.std(valid_similarities)
+            adaptive_threshold = max(0.25, mean_sim + 0.3 * std_sim)
+        else:
+            adaptive_threshold = 0.25
+            
         logging.info(f"🎯 Seuil adaptatif: {adaptive_threshold:.3f}")
-
+        
         # Sélection des meilleurs résultats
-        top_indices = np.argsort(similarities)[::-1]
-        max_results = 20
-        max_items = min(len(similarities), 10000)
-
+        top_k = min(25, len(similarities))
+        top_indices = np.argpartition(similarities, -top_k)[-top_k:]
+        top_indices = top_indices[np.argsort(similarities[top_indices])][::-1]
+        
+        # Construction des résultats
         results = []
-        for i, idx in enumerate(top_indices[:max_results]):
-            if idx >= max_items or idx >= len(luminaire_metadata):
-                continue
-                
-            similarity_score = similarities[idx]
+        for idx in top_indices:
+            similarity = float(similarities[idx])
             
-            # Filtre par seuil adaptatif
-            if similarity_score < adaptive_threshold:
-                continue
-                
-            metadata = luminaire_metadata[idx] if isinstance(luminaire_metadata[idx], dict) else {}
-            
-            # 🔥 SCORING OPTIMISÉ
-            confidence_score = min(100, max(0, similarity_score * 120))
-            
-            # Qualité basée sur le score
-            if confidence_score >= 80:
-                quality = 'excellent'
-            elif confidence_score >= 65:
-                quality = 'good'
-            elif confidence_score >= 45:
-                quality = 'fair'
-            else:
-                quality = 'low'
-            
-            result_item = {
-                'rank': i + 1,
-                'similarity': round(max(0, min(100, similarity_score * 100)), 1),
-                'confidence': round(confidence_score, 1),
-                'quality': quality,
-                'metadata': {
-                    'id': metadata.get('id', str(idx)),
-                    'name': metadata.get('name', f'Luminaire {idx}'),
-                    'description': metadata.get('description', ''),
-                    'price': float(metadata.get('price', 0.0)),
-                    'category': metadata.get('category', ''),
-                    'style': metadata.get('style', ''),
-                    'material': metadata.get('material', ''),
-                    'image_path': metadata.get('image_path', f'data/images/{idx}.jpg')
-                }
-            }
-            results.append(result_item)
-
-        best_score = results[0]['similarity'] if results else 0
-        best_confidence = results[0]['confidence'] if results else 0
+            if similarity >= adaptive_threshold:
+                try:
+                    metadata = luminaire_metadata[idx]
+                    
+                    # Calcul confidence amélioré
+                    confidence = min(100, max(0, int((similarity - 0.2) * 125)))
+                    
+                    # Qualité basée sur similarity
+                    if similarity >= 0.8:
+                        quality = 'excellent'
+                        quality_score = 95
+                    elif similarity >= 0.65:
+                        quality = 'very_good'
+                        quality_score = 85
+                    elif similarity >= 0.5:
+                        quality = 'good'
+                        quality_score = 75
+                    elif similarity >= 0.35:
+                        quality = 'fair'
+                        quality_score = 60
+                    else:
+                        quality = 'low'
+                        quality_score = 40
+                    
+                    result = {
+                        'filename': metadata.get('filename', f'image_{idx}.jpg'),
+                        'similarity': round(similarity, 4),
+                        'confidence': confidence,
+                        'quality': quality,
+                        'quality_score': quality_score,
+                        'url': f"/static/compressed/{metadata.get('filename', f'img_{idx}.jpg')}",
+                        'index': int(idx)
+                    }
+                    
+                    results.append(result)
+                    
+                except Exception as e:
+                    logging.warning(f"⚠️ Erreur métadonnées index {idx}: {e}")
+                    continue
+                    
+            # Limite pour performance
+            if len(results) >= 15:
+                break
+        
+        # Tri final par similarity
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # Nettoyage mémoire
+        cleanup_memory()
+        
+        # Statistiques
+        best_score = max([r['similarity'] for r in results], default=0)
         avg_confidence = np.mean([r['confidence'] for r in results]) if results else 0
         
-        logging.info(f"✅ Recherche terminée: {len(results)} résultats, meilleur: {best_score}%")
-
+        logging.info(f"✅ Trouvé {len(results)} résultats, meilleur: {best_score:.3f}")
+        
         return jsonify({
             'success': True,
             'results': results,
-            'message': f'{len(results)} résultats trouvés',
-            'model_info': {
-                'name': 'MobileNet V2 Optimisé',
-                'version': '2.0',
-                'features': 'Preprocessing + Similarité Hybride'
-            },
-            'improvements': {
-                'preprocessing': 'Contraste + Gamma correction',
-                'similarity': 'Hybrid (Cosine+Euclidean+Dot)',
-                'threshold': 'Adaptatif intelligent',
-                'scoring': 'Optimisé luminaires'
-            },
-            'quality_stats': {
-                'excellent': len([r for r in results if r['quality'] == 'excellent']),
-                'good': len([r for r in results if r['quality'] == 'good']),
-                'fair': len([r for r in results if r['quality'] == 'fair']),
-                'low': len([r for r in results if r['quality'] == 'low'])
-            },
-            'stats': {
-                'total_searched': max_items,
-                'results_count': len(results),
-                'best_similarity': best_score,
-                'best_confidence': round(best_confidence, 1),
+            'query_info': {
+                'total_database': len(luminaire_embeddings),
+                'valid_database': int(np.sum(valid_indices)),
+                'results_found': len(results),
+                'best_similarity': round(best_score, 4),
                 'avg_confidence': round(avg_confidence, 1),
-                'adaptive_threshold': round(adaptive_threshold * 100, 1),
-                'query_dimensions': query_embedding.shape[0],
-                'db_dimensions': database_embeddings.shape[1] if len(database_embeddings) > 0 else 0
+                'adaptive_threshold': round(adaptive_threshold, 3),
+                'query_norm': round(float(query_norm), 3),
+                'feature_dims': int(query_embedding.shape[0])
             }
         })
         
     except Exception as e:
+        cleanup_memory()
         logging.error(f"❌ Erreur recherche: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': f'Erreur: {str(e)}'}), 500
+        return jsonify({'success': False, 'error': f'Erreur système: {str(e)}'}), 500
 
 @app.route('/api/search', methods=['POST'])
 def api_search_similar():
+    """Endpoint API pour recherche"""
     return search_similar()
+
+@app.route('/health')
+def health_check():
+    """Endpoint de santé"""
+    try:
+        is_ready = all(x is not None for x in [embedding_model, luminaire_embeddings, luminaire_metadata])
+        return jsonify({
+            'status': 'healthy' if is_ready else 'initializing',
+            'model_loaded': embedding_model is not None,
+            'embeddings_loaded': luminaire_embeddings is not None,
+            'metadata_loaded': luminaire_metadata is not None,
+            'database_size': len(luminaire_embeddings) if luminaire_embeddings is not None else 0
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'success': False, 'error': 'Route non trouvée'}), 404
+    return jsonify({'success': False, 'error': 'Endpoint non trouvé'}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return jsonify({'success': False, 'error': 'Erreur serveur'}), 500
+    cleanup_memory()
+    return jsonify({'success': False, 'error': 'Erreur serveur interne'}), 500
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({'success': False, 'error': 'Image trop volumineuse (max 16MB)'}), 413
 
 if __name__ == '__main__':
-    logging.info("🚀 Démarrage serveur OPTIMISÉ v2.0...")
+    logging.info("🚀 Démarrage serveur OPTIMISÉ v2.1...")
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
-
